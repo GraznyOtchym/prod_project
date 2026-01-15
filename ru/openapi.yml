@@ -1,0 +1,2163 @@
+openapi: 3.0.3
+info:
+  title: Anti-fraud Service API
+  version: 1.3.0
+  description: |
+    # Сервис антифрода
+
+    REST API для обнаружения мошеннических транзакций с использованием настраиваемых DSL-правил.
+
+    ## Роли пользователей
+    - **ADMIN** — полный доступ: управление пользователями, правилами, просмотр всех транзакций и статистики
+    - **USER** — ограниченный доступ: только свой профиль, свои транзакции, создание транзакций для себя
+
+    ## Аутентификация (JWT)
+
+    Используется Bearer-токен в заголовке `Authorization: Bearer <token>`.
+
+    **Параметры JWT:**
+    - Алгоритм: HS256
+    - Время жизни: 1 час (3600 секунд)
+    - Секрет: из переменной окружения `RANDOM_SECRET` (128 символов)
+
+    **Payload токена:**
+    ```json
+    {
+      "sub": "<userId>",
+      "role": "USER|ADMIN",
+      "iat": 1234567890,
+      "exp": 1234571490
+    }
+    ```
+
+    ## DSL для правил фрода
+
+    Правила описываются на простом языке выражений.
+
+    **Грамматика (EBNF):**
+    ```
+    expression = term { "OR" term }
+    term       = factor { "AND" factor }
+    factor     = "NOT" factor | comparison | "(" expression ")"
+    comparison = field operator value
+    field      = "amount" | "currency" | "merchantId" | "ipAddress" | "deviceId"
+               | "user.age" | "user.region"
+    operator   = ">" | ">=" | "<" | "<=" | "=" | "!="
+    value      = number | string
+    string     = "'" { character } "'"
+    number     = digit { digit } [ "." digit { digit } ]
+    ```
+
+    **Важные правила парсинга:**
+    - Операторы AND, OR, NOT — регистроНЕзависимы (and = AND = And)
+    - Пробелы игнорируются (amount>10000 = amount > 10000)
+    - Строки сравниваются регистроЗАВИСИМО ('RUB' != 'rub')
+    - Приоритет операторов: NOT > AND > OR
+    - Если поле user.age или user.region равно null — правило НЕ срабатывает (возвращает false)
+
+    **Примеры:**
+    - `amount > 10000`
+    - `amount > 5000 AND currency = 'RUB'`
+    - `user.age < 21 AND amount > 10000`
+    - `(amount > 10000 OR user.region = 'HIGH_RISK') AND NOT (currency = 'USD')`
+
+    ## HTTP-коды ответов
+
+    | Код | Когда возвращается |
+    |-----|-------------------|
+    | 200 | Успешный GET/PUT |
+    | 201 | Успешный POST (создание ресурса), включая DECLINED транзакции |
+    | 204 | Успешный DELETE |
+    | 400 | Невалидный JSON, неподдерживаемый Content-Type |
+    | 401 | Отсутствует/невалидный/истёкший токен |
+    | 403 | Недостаточно прав (роль или доступ к чужому ресурсу) |
+    | 404 | Ресурс не найден |
+    | 409 | Конфликт (email занят, имя правила занято) |
+    | 422 | Ошибка валидации полей |
+    | 423 | Пользователь деактивирован |
+
+    ## Хранение данных
+
+    - DECLINED транзакции сохраняются в БД вместе с результатами проверки правил
+    - GET /transactions/{id} возвращает сохранённые ruleResults (не пересчитывает)
+    - DELETE /users/{id} ставит isActive=false (не удаляет физически)
+    - DELETE /fraud-rules/{id} ставит enabled=false (не удаляет физически)
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Auth
+    description: Регистрация и авторизация
+  - name: Users
+    description: Управление пользователями и профилями
+  - name: Transactions
+    description: Транзакции (покупки), запуск антифрода
+  - name: FraudRules
+    description: Управление правилами фрода
+  - name: Statistics
+    description: Статистика/аналитика (метрики и разрезы)
+
+security:
+  - BearerAuth: []
+
+paths:
+  /ping:
+    get:
+      tags: [Auth]
+      summary: Health check
+      description: |
+        Проверка работоспособности сервиса.
+        Возвращает 200 OK если сервис готов обрабатывать запросы.
+      security: []
+      responses:
+        '200':
+          description: Сервис работает
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Регистрация нового пользователя
+      description: |
+        Сценарии:
+        - 201: пользователь создан, роль USER по умолчанию, возвращается accessToken и профиль.
+        - 409: email уже используется.
+        - 422: не проходит валидация (email, пароль, возраст и т.д.).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+            examples:
+              ok:
+                summary: Успешная регистрация
+                value:
+                  email: user@example.com
+                  password: "Qwerty_123"
+                  fullName: "Ivan Ivanov"
+                  region: "RU-MOW"
+                  gender: MALE
+                  age: 25
+                  maritalStatus: SINGLE
+      responses:
+        '201':
+          description: |
+            Пользователь успешно зарегистрирован.
+            Примечание: accessToken используется в Authorization: Bearer <token>.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+              examples:
+                created:
+                  summary: Токен + профиль
+                  value:
+                    accessToken: "eyJhbGciOi..."
+                    user:
+                      id: "550e8400-e29b-41d4-a716-446655440000"
+                      email: "user@example.com"
+                      fullName: "Ivan Ivanov"
+                      region: "RU-MOW"
+                      gender: "MALE"
+                      age: 25
+                      maritalStatus: "SINGLE"
+                      role: "USER"
+                      isActive: true
+                      createdAt: "2025-12-15T10:00:00Z"
+                      updatedAt: "2025-12-15T10:00:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Email уже занят
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              examples:
+                conflict:
+                  value:
+                    code: EMAIL_ALREADY_EXISTS
+                    message: "Пользователь с таким email уже существует"
+                    traceId: "550e8400-e29b-41d4-a716-446655440001"
+                    timestamp: "2025-12-15T10:00:00Z"
+                    path: "/api/v1/auth/register"
+                    details:
+                      field: "email"
+                      value: "user@example.com"
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Авторизация пользователя
+      description: |
+        Сценарии:
+        - 200: корректные credentials => accessToken.
+        - 401: неверный email/пароль (не раскрываем, что именно неверно).
+        - 423: пользователь деактивирован (isActive=false).
+        - 422: формат email/пароля невалиден.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            examples:
+              ok:
+                value:
+                  email: "user@example.com"
+                  password: "Qwerty_123"
+      responses:
+        '200':
+          description: Успешная авторизация
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /users:
+    get:
+      tags: [Users]
+      summary: Список пользователей
+      description: |
+        Только ADMIN.
+        Сценарии:
+        - 200: страница пользователей
+        - 422: некорректные page/size
+      x-roles: [ADMIN]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Список пользователей
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PagedUsers' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    post:
+      tags: [Users]
+      summary: Создание пользователя админом
+      description: |
+        Только ADMIN. В ответе нет токенов (создание "из админки").
+        Сценарии:
+        - 201: создан
+        - 409: email занят
+        - 422: не проходит валидация полей (пароль/роль/возраст и т.д.)
+      x-roles: [ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserCreateRequest' }
+      responses:
+        '201':
+          description: Пользователь создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /users/me:
+    get:
+      tags: [Users]
+      summary: Получить профиль текущего пользователя
+      description: |
+        Возвращает профиль пользователя, определённого по JWT токену.
+        Удобный способ получить свой профиль без знания своего ID.
+
+        Доступно для любой роли (ADMIN, USER).
+      x-roles: [ADMIN, USER]
+      responses:
+        '200':
+          description: Профиль текущего пользователя
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    put:
+      tags: [Users]
+      summary: Обновить профиль текущего пользователя
+      description: |
+        Полное обновление профиля текущего пользователя.
+        Необходимо передать все поля. Чтобы очистить поле, передайте null.
+
+        **Обязательные поля:** fullName, age, region, gender, maritalStatus
+        **Поля, которые могут быть null:** age, region, gender, maritalStatus
+        **Поля, которые НЕ могут быть null:** fullName
+
+        **Ограничения для USER:**
+        - Нельзя менять role — вернёт 403
+        - Нельзя менять isActive — вернёт 403
+
+        ADMIN может менять любые поля своего профиля, включая role и isActive.
+      x-roles: [ADMIN, USER]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserUpdateRequest' }
+            examples:
+              fullUpdate:
+                summary: Полное обновление с null
+                value:
+                  fullName: "Иван Иванов"
+                  age: 30
+                  region: "RU-SPB"
+                  gender: null
+                  maritalStatus: "MARRIED"
+      responses:
+        '200':
+          description: Обновлённый профиль
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Users]
+      summary: Получение профиля пользователя
+      description: |
+        Доступ:
+        - ADMIN: любой пользователь
+        - USER: только собственный профиль (id == sub/id в токене)
+        Сценарии:
+        - 200: найден
+        - 403: попытка USER прочитать чужой профиль
+        - 404: не найден
+      x-roles: [ADMIN, USER]
+      responses:
+        '200':
+          description: Профиль пользователя
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Users]
+      summary: Полное обновление профиля пользователя
+      description: |
+        Полное обновление профиля. Необходимо передать все поля.
+        Чтобы очистить поле, передайте null.
+
+        **Обязательные поля:** fullName, age, region, gender, maritalStatus
+        **Поля, которые могут быть null:** age, region, gender, maritalStatus
+        **Поля, которые НЕ могут быть null:** fullName
+
+        **Права доступа:**
+        - ADMIN: может обновлять любой профиль, включая role и isActive
+        - USER: только свой профиль (id в URL == id в токене)
+
+        **Ограничения для USER:**
+        - Попытка изменить role => 403 FORBIDDEN
+        - Попытка изменить isActive => 403 FORBIDDEN
+        - Попытка обновить чужой профиль => 403 FORBIDDEN
+
+        **Валидация:**
+        - fullName: 2-200 символов (обязательный, не может быть null)
+        - age: 18-120 или null
+        - region: до 32 символов или null
+        - email изменить нельзя (игнорируется, если передан)
+      x-roles: [ADMIN, USER]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserUpdateRequest' }
+            examples:
+              fullUpdate:
+                summary: Полное обновление с null
+                value:
+                  fullName: "Новое Имя"
+                  age: 25
+                  region: null
+                  gender: "MALE"
+                  maritalStatus: null
+      responses:
+        '200':
+          description: Обновлённый профиль
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    delete:
+      tags: [Users]
+      summary: Деактивация пользователя
+      description: |
+        **Важно:** Это soft-delete. Пользователь НЕ удаляется физически из базы данных,
+        а помечается как неактивный (isActive = false).
+
+        Только ADMIN может деактивировать пользователей.
+
+        **Идемпотентность:**
+        - Повторный вызов для уже деактивированного пользователя => 204 (не ошибка)
+        - Несуществующий пользователь => 404
+
+        **Последствия деактивации:**
+        - POST /auth/login => 423 USER_INACTIVE
+        - POST /transactions с userId деактивированного => 403 FORBIDDEN
+        - Все существующие токены пользователя продолжают работать до истечения (1 час)
+
+        **Восстановление:**
+        - ADMIN может снова активировать через PUT /users/{id} с isActive=true
+      x-roles: [ADMIN]
+      responses:
+        '204':
+          description: Пользователь деактивирован
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /transactions:
+    post:
+      tags: [Transactions]
+      summary: Создать транзакцию и выполнить антифрод-проверку
+      description: |
+        Создаёт транзакцию (покупку) и проверяет её по всем активным правилам антифрода.
+
+        **Важно:** Отклонение антифродом — это НЕ ошибка, а бизнес-решение.
+        Поэтому 201 возвращается и для APPROVED, и для DECLINED транзакций.
+
+        **Права доступа:**
+        - USER: может создавать транзакции только для себя (userId в теле == id в токене)
+        - ADMIN: может создавать транзакции для любого пользователя
+
+        **Алгоритм проверки антифрода:**
+        1. Получить профиль пользователя (userId) из БД
+        2. Загрузить все активные правила (enabled=true), отсортированные по priority ASC, затем по id ASC
+        3. Для каждого правила: распарсить dslExpression и вычислить результат
+        4. Если хотя бы одно правило matched=true => status=DECLINED, isFraud=true
+        5. Иначе => status=APPROVED, isFraud=false
+        6. Сохранить транзакцию вместе с результатами всех правил (ruleResults)
+
+        **Коды ответов:**
+        - 201: транзакция создана (APPROVED или DECLINED)
+        - 403: USER пытается создать транзакцию для другого пользователя
+        - 404: пользователь с указанным userId не найден
+        - 422: невалидные поля (amount <= 0, некорректная валюта и т.д.)
+      x-roles: [ADMIN, USER]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransactionCreateRequest' }
+            examples:
+              ok:
+                value:
+                  userId: "550e8400-e29b-41d4-a716-446655440002"
+                  amount: 1999.99
+                  currency: "RUB"
+                  merchantId: "shop-123"
+                  merchantCategoryCode: "5411"
+                  timestamp: "2025-12-15T10:01:00Z"
+                  ipAddress: "192.168.0.1"
+                  deviceId: "device-abc"
+                  channel: "WEB"
+                  location:
+                    country: "RU"
+                    city: "Moscow"
+                    latitude: 55.7558
+                    longitude: 37.6173
+      responses:
+        '201':
+          description: |
+            Транзакция создана.
+            Варианты:
+            - status=APPROVED: транзакция разрешена
+            - status=DECLINED: отклонена антифродом (ruleResults покажет, какие правила сработали)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionDecision' }
+              examples:
+                approved:
+                  summary: Одобрено
+                  value:
+                    transaction:
+                      id: "550e8400-e29b-41d4-a716-446655440003"
+                      userId: "550e8400-e29b-41d4-a716-446655440002"
+                      amount: 1999.99
+                      currency: "RUB"
+                      status: "APPROVED"
+                      merchantId: "shop-123"
+                      merchantCategoryCode: "5411"
+                      timestamp: "2025-12-15T10:01:00Z"
+                      ipAddress: "192.168.0.1"
+                      deviceId: "device-abc"
+                      channel: "WEB"
+                      location: { country: "RU", city: "Moscow", latitude: 55.7558, longitude: 37.6173 }
+                      isFraud: false
+                      metadata: { cartSize: 3 }
+                      createdAt: "2025-12-15T10:01:01Z"
+                    ruleResults:
+                      - ruleId: "550e8400-e29b-41d4-a716-446655440004"
+                        ruleName: "High amount check"
+                        priority: 10
+                        enabled: true
+                        matched: false
+                        description: "amount <= 10000, правило не сработало"
+                declined:
+                  summary: Отклонено антифродом
+                  value:
+                    transaction:
+                      id: "550e8400-e29b-41d4-a716-446655440005"
+                      userId: "550e8400-e29b-41d4-a716-446655440002"
+                      amount: 15000
+                      currency: "RUB"
+                      status: "DECLINED"
+                      merchantId: "shop-999"
+                      merchantCategoryCode: "7995"
+                      timestamp: "2025-12-15T10:05:00Z"
+                      ipAddress: "10.0.0.7"
+                      deviceId: "device-xyz"
+                      channel: "MOBILE"
+                      location: { country: "RU", city: "Moscow" }
+                      isFraud: true
+                      metadata: {}
+                      createdAt: "2025-12-15T10:05:01Z"
+                    ruleResults:
+                      - ruleId: "550e8400-e29b-41d4-a716-446655440004"
+                        ruleName: "High amount check"
+                        priority: 10
+                        enabled: true
+                        matched: true
+                        description: "amount > 10000, правило сработало"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '404':
+          description: Пользователь с указанным userId не найден
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              examples:
+                userNotFound:
+                  value:
+                    code: USER_NOT_FOUND
+                    message: "Пользователь не найден"
+                    traceId: "[UUID67]"
+                    timestamp: "2025-12-15T10:00:00Z"
+                    path: "/api/v1/transactions"
+                    details: { userId: "[UUID68]" }
+    get:
+      tags: [Transactions]
+      summary: Список транзакций
+      description: |
+        Доступ:
+        - ADMIN: все транзакции
+        - USER: только свои
+
+        Фильтры:
+        - userId (только ADMIN)
+        - status, isFraud
+        - from/to (RFC3339)
+        - page/size
+      x-roles: [ADMIN, USER]
+      parameters:
+        - in: query
+          name: userId
+          schema: { type: string, format: uuid }
+          description: Фильтр по пользователю (только ADMIN)
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/TransactionStatus' }
+        - in: query
+          name: isFraud
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Список транзакций
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PagedTransactions' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /transactions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/TransactionId'
+    get:
+      tags: [Transactions]
+      summary: Получить транзакцию
+      description: |
+        - ADMIN: любая транзакция
+        - USER: только свои
+      x-roles: [ADMIN, USER]
+      responses:
+        '200':
+          description: Транзакция + результаты правил
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionDecision' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /transactions/batch:
+    post:
+      tags: [Transactions]
+      summary: Создать батч транзакций
+      description: |
+        Батч поддерживает частичный успех.
+
+        Сценарии:
+        - 201: все элементы обработаны успешно (каждый элемент может быть APPROVED или DECLINED)
+        - 207: частичный успех (есть элементы, которые не созданы из-за 422/403/409 и т.п.)
+        Для сопоставления используется index (0-based).
+      x-roles: [ADMIN, USER]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransactionBatchCreateRequest' }
+      responses:
+        '201':
+          description: Все элементы батча обработаны (без транспортных ошибок по элементам)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionBatchResult' }
+        '207':
+          description: Частичный успех (поэлементные ошибки/валидации)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionBatchResult' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /fraud-rules:
+    get:
+      tags: [FraudRules]
+      summary: Список правил фрода
+      description: |
+        Только ADMIN.
+        Сценарии:
+        - 200: список правил
+      x-roles: [ADMIN]
+      responses:
+        '200':
+          description: Список правил
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FraudRule' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [FraudRules]
+      summary: Создать правило фрода
+      description: |
+        Только ADMIN.
+
+        Валидация:
+        - name: 3..120 символов
+        - dslExpression: обязателен, должен парситься по спецификации DSL
+        - priority: >=1 (меньше — выше приоритет)
+        Сценарии:
+        - 201: создано
+        - 422: невалидные поля или DSL синтаксически неверен
+        - 409: правило с таким именем уже есть (если включена уникальность имени)
+      x-roles: [ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FraudRuleCreateRequest' }
+            examples:
+              ok:
+                value:
+                  name: "High amount for young users"
+                  description: "Блокировать транзакции > 10000 от пользователей младше 21"
+                  dslExpression: "amount > 10000 AND user.age < 21"
+                  enabled: true
+                  priority: 5
+      responses:
+        '201':
+          description: Правило создано
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FraudRule' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /fraud-rules/validate:
+    post:
+      tags: [FraudRules]
+      summary: Валидация DSL выражения (без сохранения правила)
+      description: |
+        Только ADMIN. Полезно для UI "проверить правило".
+        Сценарии:
+        - 200: валидно (isValid=true)
+        - 200: невалидно (isValid=false, errors заполнен)
+      x-roles: [ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DslValidateRequest' }
+            examples:
+              valid:
+                value:
+                  dslExpression: "amount > 10000 AND user.age < 21"
+              invalid:
+                value:
+                  dslExpression: "amount > AND user.age < 21"
+      responses:
+        '200':
+          description: Результат проверки DSL
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DslValidateResponse' }
+              examples:
+                valid:
+                  value:
+                    isValid: true
+                    normalizedExpression: "amount > 10000 AND user.age < 21"
+                    errors: []
+                invalid:
+                  value:
+                    isValid: false
+                    normalizedExpression: null
+                    errors:
+                      - code: DSL_PARSE_ERROR
+                        message: "Ожидалось число после '>'"
+                        position: 9
+                        near: "> AND"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /fraud-rules/{id}:
+    parameters:
+      - $ref: '#/components/parameters/FraudRuleId'
+    get:
+      tags: [FraudRules]
+      summary: Получить правило фрода по ID
+      description: |
+        Возвращает полную информацию о правиле антифрода.
+
+        Только ADMIN имеет доступ к этому эндпоинту.
+
+        **Поля ответа:**
+        - id: уникальный идентификатор правила
+        - name: название правила
+        - description: описание для документации
+        - dslExpression: выражение на DSL
+        - enabled: активно ли правило (применяется при проверке транзакций)
+        - priority: приоритет (меньше = выше, проверяется раньше)
+        - createdAt, updatedAt: временные метки
+      x-roles: [ADMIN]
+      responses:
+        '200':
+          description: Правило фрода
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FraudRule' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [FraudRules]
+      summary: Обновить правило фрода
+      description: |
+        Только ADMIN. Полное обновление.
+        422 возвращается при невалидном DSL/полях.
+      x-roles: [ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FraudRuleUpdateRequest' }
+      responses:
+        '200':
+          description: Обновлённое правило
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FraudRule' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    delete:
+      tags: [FraudRules]
+      summary: Деактивация правила фрода
+      description: |
+        **Важно:** Это soft-delete. Правило НЕ удаляется физически из базы данных,
+        а помечается как неактивное (enabled = false).
+
+        Только ADMIN может деактивировать правила.
+
+        **Идемпотентность:**
+        - Повторный вызов для уже деактивированного правила => 204 (не ошибка)
+        - Несуществующее правило => 404
+
+        **Последствия деактивации:**
+        - Правило больше не применяется при проверке транзакций
+        - Правило остаётся в базе и доступно через GET /fraud-rules/{id}
+        - Статистика по правилу сохраняется
+
+        **Восстановление:**
+        - ADMIN может снова активировать через PUT /fraud-rules/{id} с enabled=true
+      x-roles: [ADMIN]
+      responses:
+        '204':
+          description: Правило деактивировано
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # -------------------- Statistics --------------------
+  /stats/overview:
+    get:
+      tags: [Statistics]
+      summary: Обзор ключевых метрик (дашборд)
+      description: |
+        Возвращает агрегированные метрики за указанный период для дашборда.
+
+        Только ADMIN имеет доступ к этому эндпоинту.
+
+        **Ограничения периода:**
+        - from < to (иначе 422)
+        - Максимальный период: 90 дней (иначе 422)
+        - Если from/to не указаны — последние 30 дней
+
+        **Метрики:**
+        - volume: общее количество транзакций
+        - gmv: Gross Merchandise Value (сумма всех транзакций)
+        - approvalRate: доля APPROVED транзакций (0..1)
+        - declineRate: доля DECLINED транзакций (0..1)
+        - topRiskMerchants: топ-10 мерчантов по declineRate
+      x-roles: [ADMIN]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Timezone'
+      responses:
+        '200':
+          description: Overview статистики
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatsOverview' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /stats/transactions/timeseries:
+    get:
+      tags: [Statistics]
+      summary: Таймсерия по транзакциям
+      description: |
+        Возвращает временной ряд метрик транзакций для построения графиков.
+
+        Только ADMIN имеет доступ к этому эндпоинту.
+
+        **Ограничения периода:**
+        - from < to (иначе 422)
+        - Максимальный период: 90 дней (иначе 422)
+        - Если from/to не указаны — последние 7 дней
+
+        **Группировка (groupBy):**
+        - hour: точки по часам (макс период 7 дней)
+        - day: точки по дням (макс период 90 дней)
+        - week: точки по неделям (макс период 1 год)
+
+        **Метрики в каждой точке:**
+        - txCount: количество транзакций
+        - gmv: сумма транзакций
+        - approvalRate, declineRate: доли по статусам
+      x-roles: [ADMIN]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/GroupBy'
+        - $ref: '#/components/parameters/Timezone'
+        - in: query
+          name: channel
+          schema: { $ref: '#/components/schemas/TransactionChannel' }
+          description: Опциональный фильтр по каналу
+      responses:
+        '200':
+          description: Таймсерия
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionsTimeSeries' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /stats/rules/matches:
+    get:
+      tags: [Statistics]
+      summary: Статистика срабатываний правил
+      description: |
+        Возвращает статистику по срабатываниям правил антифрода за период.
+
+        Только ADMIN имеет доступ к этому эндпоинту.
+
+        **Ограничения периода:**
+        - from < to (иначе 422)
+        - Максимальный период: 90 дней (иначе 422)
+        - Если from/to не указаны — последние 30 дней
+
+        **Метрики для каждого правила:**
+        - matches: сколько раз правило сработало (matched=true)
+        - uniqueUsers: сколько уникальных пользователей затронуто
+        - uniqueMerchants: сколько уникальных мерчантов затронуто
+        - shareOfDeclines: доля DECLINED транзакций, где это правило было среди matched
+
+        Результаты отсортированы по matches DESC.
+      x-roles: [ADMIN]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - in: query
+          name: top
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+          description: Топ-N правил по matches
+      responses:
+        '200':
+          description: Статистика по правилам
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleMatchStats' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /stats/merchants/risk:
+    get:
+      tags: [Statistics]
+      summary: Риск-метрики по мерчантам
+      description: |
+        Только ADMIN.
+        Метрики по merchantId/merchantCategoryCode:
+        - txCount, gmv
+        - declineRate
+        - fraudRate
+      x-roles: [ADMIN]
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - in: query
+          name: merchantCategoryCode
+          schema: { type: string, pattern: '^\d{4}$' }
+        - in: query
+          name: top
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Merchant risk stats
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MerchantRiskStats' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /stats/users/{id}/risk-profile:
+    get:
+      tags: [Statistics]
+      summary: Риск-профиль пользователя (в т.ч. для USER — только свой)
+      description: |
+        Доступ:
+        - ADMIN: любой пользователь
+        - USER: только свой (id == id в токене)
+
+        Метрики:
+        - txCount_24h / gmv_24h
+        - distinctDevices_24h / distinctIps_24h / distinctCities_24h
+        - declineRate_30d
+        - lastSeenAt
+      x-roles: [ADMIN, USER]
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: Risk profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserRiskProfile' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    UserId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+      description: Идентификатор пользователя (UUID)
+    TransactionId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+      description: Идентификатор транзакции (UUID)
+    FraudRuleId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+      description: Идентификатор правила (UUID)
+
+    Page:
+      in: query
+      name: page
+      schema: { type: integer, minimum: 0, default: 0 }
+    Size:
+      in: query
+      name: size
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+
+    From:
+      in: query
+      name: from
+      schema: { type: string, format: date-time }
+      description: |
+        Начало периода (RFC3339, включительно).
+
+        **Валидация:**
+        - Должен быть меньше `to` (иначе 422)
+        - Разница между from и to не более 90 дней (иначе 422)
+
+        **По умолчанию:**
+        - /stats/overview: now - 30 дней
+        - /stats/transactions/timeseries: now - 7 дней
+        - /stats/rules/matches: now - 30 дней
+        - /stats/merchants/risk: now - 30 дней
+    To:
+      in: query
+      name: to
+      schema: { type: string, format: date-time }
+      description: |
+        Конец периода (RFC3339, исключительно).
+
+        **Валидация:**
+        - Должен быть больше `from` (иначе 422)
+        - Разница между from и to не более 90 дней (иначе 422)
+
+        **По умолчанию:** текущее время (now)
+
+    Timezone:
+      in: query
+      name: timezone
+      schema: { type: string, example: "Europe/Moscow", default: "UTC" }
+      description: Таймзона для агрегаций/группировок
+
+    GroupBy:
+      in: query
+      name: groupBy
+      schema:
+        type: string
+        enum: [hour, day, week]
+        default: day
+
+  responses:
+    BadRequest:
+      description: |
+        Неверный запрос на уровне транспорта/формата:
+        - невалидный JSON
+        - неподдерживаемый Content-Type
+        - слишком большой payload
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          examples:
+            badJson:
+              value:
+                code: BAD_REQUEST
+                message: "Невалидный JSON"
+                traceId: "550e8400-e29b-41d4-a716-446655440010"
+                timestamp: "2025-12-15T10:00:00Z"
+                path: "/api/v1/transactions"
+                details: { hint: "Проверьте запятые/кавычки" }
+
+    ValidationFailed:
+      description: |
+        Ошибка валидации данных (семантика запроса).
+        Возвращается, когда JSON корректный, но поля не проходят проверки.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ValidationError' }
+          examples:
+            invalidAmount:
+              value:
+                code: VALIDATION_FAILED
+                message: "Некоторые поля не прошли валидацию"
+                traceId: "550e8400-e29b-41d4-a716-446655440011"
+                timestamp: "2025-12-15T10:00:00Z"
+                path: "/api/v1/transactions"
+                fieldErrors:
+                  - field: "amount"
+                    issue: "must be >= 0.01"
+                    rejectedValue: -10
+
+    Unauthorized:
+      description: Требуется аутентификация (токен отсутствует/невалиден/истёк)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          examples:
+            noToken:
+              value:
+                code: UNAUTHORIZED
+                message: "Токен отсутствует или невалиден"
+                traceId: "550e8400-e29b-41d4-a716-446655440012"
+                timestamp: "2025-12-15T10:00:00Z"
+                path: "/api/v1/users"
+
+    Forbidden:
+      description: Доступ запрещён (недостаточно прав или попытка доступа к чужому ресурсу)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          examples:
+            notAdmin:
+              value:
+                code: FORBIDDEN
+                message: "Недостаточно прав для выполнения операции"
+                traceId: "550e8400-e29b-41d4-a716-446655440013"
+                timestamp: "2025-12-15T10:00:00Z"
+                path: "/api/v1/fraud-rules"
+
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          examples:
+            userNotFound:
+              value:
+                code: NOT_FOUND
+                message: "Пользователь не найден"
+                traceId: "550e8400-e29b-41d4-a716-446655440014"
+                timestamp: "2025-12-15T10:00:00Z"
+                path: "/api/v1/users/550e8400-e29b-41d4-a716-446655440099"
+
+    Conflict:
+      description: Конфликт (email занят, имя правила занято)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          examples:
+            email:
+              value:
+                code: EMAIL_ALREADY_EXISTS
+                message: "Пользователь с таким email уже существует"
+                traceId: "550e8400-e29b-41d4-a716-446655440015"
+                timestamp: "2025-12-15T10:00:00Z"
+                path: "/api/v1/users"
+
+    Locked:
+      description: Ресурс заблокирован (например, пользователь деактивирован)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          examples:
+            inactive:
+              value:
+                code: USER_INACTIVE
+                message: "Пользователь деактивирован"
+                timestamp: "2025-12-15T10:00:00Z"
+                path: "/api/v1/auth/login"
+
+  schemas:
+    # ---------- Общие ----------
+    ErrorCode:
+      type: string
+      description: |
+        Код ошибки (машиночитаемый).
+        Используется для программной обработки ошибок на клиенте.
+      enum:
+        - BAD_REQUEST
+        - VALIDATION_FAILED
+        - UNAUTHORIZED
+        - FORBIDDEN
+        - NOT_FOUND
+        - USER_NOT_FOUND
+        - EMAIL_ALREADY_EXISTS
+        - USER_INACTIVE
+        - DSL_PARSE_ERROR
+        - DSL_INVALID_FIELD
+        - DSL_INVALID_OPERATOR
+        - RULE_NAME_ALREADY_EXISTS
+        - INTERNAL_SERVER_ERROR
+
+    ApiError:
+      type: object
+      required: [code, message, traceId, timestamp, path]
+      description: |
+        Стандартный формат ошибки API.
+        Все ошибки (кроме 2xx) возвращают этот формат.
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          description: Человекочитаемое сообщение (для отображения пользователю)
+          example: Неверный запрос
+        traceId:
+          type: string
+          format: uuid
+          description: |
+            Уникальный идентификатор запроса для трейсинга.
+            Используется для поиска в логах при отладке.
+          example: "[UUID73]"
+        timestamp:
+          type: string
+          format: date-time
+          description: Время возникновения ошибки (ISO 8601, UTC)
+        path:
+          type: string
+          description: Путь запроса, на котором произошла ошибка
+          example: "/api/v1/transactions"
+        details:
+          type: object
+          additionalProperties: true
+          description: Дополнительные детали ошибки
+
+    ValidationError:
+      type: object
+      required: [code, message, traceId, timestamp, path, fieldErrors]
+      properties:
+        code:
+          type: string
+          example: VALIDATION_FAILED
+        message:
+          type: string
+        traceId:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+        path:
+          type: string
+        fieldErrors:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    FieldError:
+      type: object
+      required: [field, issue]
+      properties:
+        field:
+          type: string
+          description: Имя поля с ошибкой (может быть вложенным, например "location.latitude")
+          example: "amount"
+        issue:
+          type: string
+          description: Описание проблемы
+          example: "must be >= 0.01"
+        rejectedValue:
+          description: Значение, которое не прошло валидацию
+          nullable: true
+
+    UserRole:
+      type: string
+      enum: [ADMIN, USER]
+      description: Роль пользователя в системе
+
+    Gender:
+      type: string
+      enum: [MALE, FEMALE]
+
+    MaritalStatus:
+      type: string
+      enum: [SINGLE, MARRIED, DIVORCED, WIDOWED]
+
+    TransactionStatus:
+      type: string
+      enum: [APPROVED, DECLINED]
+      description: |
+        Статус транзакции:
+        - APPROVED: транзакция одобрена
+        - DECLINED: транзакция отклонена антифродом
+
+    TransactionChannel:
+      type: string
+      enum: [WEB, MOBILE, POS, OTHER]
+      description: Канал совершения транзакции
+
+    CurrencyCode:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      description: ISO 4217 код валюты
+      example: "RUB"
+
+    MccCode:
+      type: string
+      pattern: '^\d{4}$'
+      description: Merchant Category Code (4 цифры)
+      example: "5411"
+
+    # ---------- Auth ----------
+    RegisterRequest:
+      type: object
+      required: [email, password, fullName]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Email пользователя (уникальный)
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 72
+          pattern: '^(?=.*[A-Za-z])(?=.*\d).+$'
+          writeOnly: true
+          description: |
+            Пароль. Требования:
+            - Минимум 8 символов
+            - Минимум 1 буква (A-Z или a-z)
+            - Минимум 1 цифра (0-9)
+        fullName:
+          type: string
+          minLength: 2
+          maxLength: 200
+          description: Полное имя пользователя
+          example: Ivan Ivanov
+        region:
+          type: string
+          maxLength: 32
+          description: Регион пользователя (код региона или произвольная строка)
+          example: RU-MOW
+        gender:
+          $ref: '#/components/schemas/Gender'
+        age:
+          type: integer
+          minimum: 18
+          maximum: 120
+          description: Возраст (минимум 18 лет)
+          example: 25
+        maritalStatus:
+          $ref: '#/components/schemas/MaritalStatus'
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 72
+          writeOnly: true
+
+    AuthResponse:
+      type: object
+      required: [accessToken, expiresIn, user]
+      description: |
+        Ответ при успешной аутентификации.
+        Содержит JWT токен, время его жизни и профиль пользователя.
+      properties:
+        accessToken:
+          type: string
+          description: |
+            JWT токен для авторизации запросов.
+            Передавать в заголовке: Authorization: Bearer <token>
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        expiresIn:
+          type: integer
+          minimum: 1
+          description: |
+            Время жизни токена в секундах.
+            После истечения токен становится невалидным и нужно получить новый через /auth/login.
+          example: 3600
+        user:
+          $ref: '#/components/schemas/User'
+
+    # ---------- Users ----------
+    User:
+      type: object
+      required: [id, email, fullName, role, isActive, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        fullName:
+          type: string
+          minLength: 2
+          maxLength: 200
+        region:
+          type: string
+          maxLength: 32
+          description: Регион проживания
+        gender:
+          $ref: '#/components/schemas/Gender'
+        age:
+          type: integer
+          minimum: 18
+          maximum: 120
+        maritalStatus:
+          $ref: '#/components/schemas/MaritalStatus'
+        role:
+          $ref: '#/components/schemas/UserRole'
+        isActive:
+          type: boolean
+          default: true
+          description: Активен ли пользователь (деактивированные не могут входить)
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    UserCreateRequest:
+      type: object
+      required: [email, password, fullName, role]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 72
+          pattern: '^(?=.*[A-Za-z])(?=.*\d).+$'
+          writeOnly: true
+        fullName:
+          type: string
+          minLength: 2
+          maxLength: 200
+        region:
+          type: string
+          maxLength: 32
+        gender:
+          $ref: '#/components/schemas/Gender'
+        age:
+          type: integer
+          minimum: 18
+          maximum: 120
+        maritalStatus:
+          $ref: '#/components/schemas/MaritalStatus'
+        role:
+          $ref: '#/components/schemas/UserRole'
+
+    UserUpdateRequest:
+      type: object
+      required: [fullName, age, region, gender, maritalStatus]
+      description: |
+        Полное обновление профиля. Необходимо передать все поля.
+        Чтобы очистить опциональное поле, передайте null.
+        USER может обновлять только свой профиль и не может менять role/isActive.
+        ADMIN может обновлять любой профиль, включая role/isActive.
+      properties:
+        fullName:
+          type: string
+          minLength: 2
+          maxLength: 200
+        region:
+          type: string
+          maxLength: 32
+          nullable: true
+        gender:
+          allOf:
+            - $ref: '#/components/schemas/Gender'
+          nullable: true
+        age:
+          type: integer
+          minimum: 18
+          maximum: 120
+          nullable: true
+        maritalStatus:
+          allOf:
+            - $ref: '#/components/schemas/MaritalStatus'
+          nullable: true
+        role:
+          $ref: '#/components/schemas/UserRole'
+          description: Только ADMIN может менять role. USER получит 403 при попытке.
+        isActive:
+          type: boolean
+          description: Только ADMIN может менять isActive.
+
+    PagedUsers:
+      type: object
+      required: [items, total, page, size]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/User' }
+        total:
+          type: integer
+          minimum: 0
+          description: Общее количество записей
+        page:
+          type: integer
+          minimum: 0
+          description: Текущая страница (0-based)
+        size:
+          type: integer
+          minimum: 1
+          description: Размер страницы
+
+    # ---------- Transactions ----------
+    TransactionLocation:
+      type: object
+      description: |
+        Географическое местоположение транзакции.
+
+        **Правила валидации:**
+        - country и city — независимые поля, можно передавать по отдельности
+        - latitude и longitude — зависимые поля: либо оба, либо ни одного
+        - Если передать только latitude без longitude (или наоборот) => 422 VALIDATION_FAILED
+      properties:
+        country:
+          type: string
+          minLength: 2
+          maxLength: 2
+          pattern: '^[A-Z]{2}$'
+          description: ISO 3166-1 alpha-2 код страны (заглавные буквы)
+          example: RU
+        city:
+          type: string
+          maxLength: 128
+          description: Название города
+          example: Moscow
+        latitude:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+          description: Широта (требует longitude)
+          example: 55.7558
+        longitude:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+          description: Долгота (требует latitude)
+          example: 37.6173
+
+    Transaction:
+      type: object
+      required: [id, userId, amount, currency, status, timestamp, isFraud, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          maximum: 999999999.99
+          description: Сумма транзакции
+          example: 1999.99
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        status:
+          $ref: '#/components/schemas/TransactionStatus'
+        merchantId:
+          type: string
+          maxLength: 64
+          description: Идентификатор мерчанта
+          example: shop-123
+        merchantCategoryCode:
+          $ref: '#/components/schemas/MccCode'
+        timestamp:
+          type: string
+          format: date-time
+          description: Время совершения операции (указывается клиентом)
+        ipAddress:
+          type: string
+          maxLength: 64
+          description: IP-адрес клиента
+          example: 192.168.0.1
+        deviceId:
+          type: string
+          maxLength: 128
+          description: Идентификатор устройства
+          example: device-abc
+        channel:
+          $ref: '#/components/schemas/TransactionChannel'
+        location:
+          $ref: '#/components/schemas/TransactionLocation'
+        isFraud:
+          type: boolean
+          description: Признак того, что транзакция помечена как фродовая (сработало хотя бы одно правило)
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Произвольные дополнительные данные
+        createdAt:
+          type: string
+          format: date-time
+          description: Время создания записи в системе
+
+    TransactionCreateRequest:
+      type: object
+      required: [userId, amount, currency, timestamp]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: |
+            ID пользователя, для которого создаётся транзакция.
+            USER может создавать только для себя (userId == id из токена).
+            ADMIN может создавать для любого пользователя.
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          maximum: 999999999.99
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        merchantId:
+          type: string
+          maxLength: 64
+        merchantCategoryCode:
+          $ref: '#/components/schemas/MccCode'
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            Время операции. Не должно быть слишком далеко в будущем (> now + 5 минут => 422).
+        ipAddress:
+          type: string
+          maxLength: 64
+        deviceId:
+          type: string
+          maxLength: 128
+        channel:
+          $ref: '#/components/schemas/TransactionChannel'
+        location:
+          $ref: '#/components/schemas/TransactionLocation'
+        metadata:
+          type: object
+          additionalProperties: true
+
+    TransactionBatchCreateRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 500
+          description: Массив транзакций для батч-создания
+          items: { $ref: '#/components/schemas/TransactionCreateRequest' }
+
+    FraudRuleEvaluationResult:
+      type: object
+      required: [ruleId, ruleName, priority, enabled, matched]
+      description: Результат проверки одной транзакции по одному правилу фрода.
+      properties:
+        ruleId:
+          type: string
+          format: uuid
+        ruleName:
+          type: string
+        priority:
+          type: integer
+          minimum: 1
+        enabled:
+          type: boolean
+        matched:
+          type: boolean
+          description: true если правило сработало (условие выполнено)
+        description:
+          type: string
+          description: Человекочитаемое описание результата проверки
+
+    TransactionDecision:
+      type: object
+      required: [transaction, ruleResults]
+      description: Результат создания транзакции с результатами проверки всех правил
+      properties:
+        transaction:
+          $ref: '#/components/schemas/Transaction'
+        ruleResults:
+          type: array
+          description: |
+            Результаты применения всех включённых правил на момент проверки.
+            Возвращаются все правила (и сработавшие, и не сработавшие).
+          items:
+            $ref: '#/components/schemas/FraudRuleEvaluationResult'
+
+    PagedTransactions:
+      type: object
+      required: [items, total, page, size]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Transaction'
+        total: { type: integer, minimum: 0 }
+        page: { type: integer, minimum: 0 }
+        size: { type: integer, minimum: 1 }
+
+    TransactionBatchResultItem:
+      type: object
+      required: [index]
+      description: Результат обработки одного элемента батча
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Индекс элемента в исходном массиве (0-based)
+        decision:
+          $ref: '#/components/schemas/TransactionDecision'
+          description: Результат, если транзакция успешно обработана
+        error:
+          $ref: '#/components/schemas/ApiError'
+          description: Ошибка, если элемент не обработан (валидация/доступ/конфликт)
+
+    TransactionBatchResult:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/TransactionBatchResultItem' }
+
+    # ---------- Fraud Rules ----------
+    FraudRule:
+      type: object
+      required: [id, name, dslExpression, enabled, priority, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 3
+          maxLength: 120
+          description: Уникальное название правила
+        description:
+          type: string
+          maxLength: 500
+          description: Описание правила (для документации)
+        dslExpression:
+          type: string
+          minLength: 3
+          maxLength: 2000
+          description: |
+            DSL-выражение правила. Поддерживаемый синтаксис:
+
+            Поля транзакции: amount, currency, merchantId, ipAddress, deviceId
+            Поля пользователя: user.age, user.region
+
+            Операторы сравнения: >, >=, <, <=, =, !=
+            Логические операторы: AND, OR, NOT
+            Скобки для группировки: ()
+
+            Примеры:
+            - amount > 10000
+            - amount > 5000 AND currency = 'RUB'
+            - user.age < 21 AND amount > 10000
+            - (amount > 10000 OR user.region = 'HIGH_RISK') AND NOT (currency = 'USD')
+        enabled:
+          type: boolean
+          default: true
+          description: Активно ли правило (неактивные не применяются)
+        priority:
+          type: integer
+          minimum: 1
+          description: Приоритет (меньше число — выше приоритет, проверяется раньше)
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    FraudRuleCreateRequest:
+      type: object
+      required: [name, dslExpression]
+      properties:
+        name:
+          type: string
+          minLength: 3
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 500
+        dslExpression:
+          type: string
+          minLength: 3
+          maxLength: 2000
+        enabled:
+          type: boolean
+          default: true
+        priority:
+          type: integer
+          minimum: 1
+          default: 100
+
+    FraudRuleUpdateRequest:
+      type: object
+      required: [name, dslExpression, enabled, priority]
+      description: Полное обновление правила (все обязательные поля должны быть указаны)
+      properties:
+        name:
+          type: string
+          minLength: 3
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 500
+        dslExpression:
+          type: string
+          minLength: 3
+          maxLength: 2000
+        enabled:
+          type: boolean
+        priority:
+          type: integer
+          minimum: 1
+
+    DslValidateRequest:
+      type: object
+      required: [dslExpression]
+      properties:
+        dslExpression:
+          type: string
+          minLength: 3
+          maxLength: 2000
+
+    DslValidateResponse:
+      type: object
+      required: [isValid, errors]
+      properties:
+        isValid:
+          type: boolean
+        normalizedExpression:
+          type: string
+          nullable: true
+          description: Нормализованное выражение (если валидно)
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/DslError'
+
+    DslError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: DSL_PARSE_ERROR
+        message:
+          type: string
+        position:
+          type: integer
+          nullable: true
+          description: Позиция ошибки в выражении (0-based)
+        near:
+          type: string
+          nullable: true
+          description: Фрагмент выражения рядом с ошибкой
+
+    # ---------- Statistics ----------
+    StatsOverview:
+      type: object
+      required: [from, to, volume, gmv, approvalRate, declineRate, topRiskMerchants]
+      description: |
+        Агрегированные метрики за указанный период.
+        Используется для дашборда администратора.
+      properties:
+        from:
+          type: string
+          format: date-time
+          description: Начало периода (включительно)
+        to:
+          type: string
+          format: date-time
+          description: Конец периода (исключительно)
+        volume:
+          type: integer
+          minimum: 0
+          description: Общее количество транзакций за период
+        gmv:
+          type: number
+          format: double
+          minimum: 0
+          description: |
+            Gross Merchandise Value — сумма amount всех транзакций.
+            Включает и APPROVED, и DECLINED транзакции.
+        approvalRate:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: |
+            Доля APPROVED транзакций (0..1).
+            approvalRate + declineRate = 1
+        declineRate:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: |
+            Доля DECLINED транзакций (0..1).
+            Эквивалентно доле транзакций с isFraud=true.
+        topRiskMerchants:
+          type: array
+          description: Топ-10 мерчантов с наибольшим declineRate
+          items: { $ref: '#/components/schemas/MerchantRiskRow' }
+
+    MerchantRiskRow:
+      type: object
+      required: [merchantId, txCount, declineRate]
+      properties:
+        merchantId:
+          type: string
+        merchantCategoryCode:
+          $ref: '#/components/schemas/MccCode'
+        txCount:
+          type: integer
+          minimum: 0
+          description: Количество транзакций
+        gmv:
+          type: number
+          format: double
+          minimum: 0
+        declineRate:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Доля отклонённых транзакций
+
+    TransactionsTimeSeries:
+      type: object
+      required: [points]
+      properties:
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionsTimePoint'
+
+    TransactionsTimePoint:
+      type: object
+      required: [bucketStart, txCount, gmv, approvalRate, declineRate]
+      description: Одна точка временного ряда
+      properties:
+        bucketStart:
+          type: string
+          format: date-time
+          description: Начало временного интервала (bucket)
+        txCount:
+          type: integer
+          minimum: 0
+          description: Количество транзакций в интервале
+        gmv:
+          type: number
+          format: double
+          minimum: 0
+          description: Сумма транзакций в интервале
+        approvalRate:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Доля APPROVED транзакций (0..1)
+        declineRate:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Доля DECLINED транзакций (0..1)
+
+    RuleMatchStats:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/RuleMatchRow' }
+
+    RuleMatchRow:
+      type: object
+      required: [ruleId, ruleName, matches, uniqueUsers, shareOfDeclines]
+      properties:
+        ruleId:
+          type: string
+          format: uuid
+        ruleName:
+          type: string
+        matches:
+          type: integer
+          minimum: 0
+          description: Количество срабатываний правила
+        uniqueUsers:
+          type: integer
+          minimum: 0
+          description: Уникальных пользователей, затронутых правилом
+        uniqueMerchants:
+          type: integer
+          minimum: 0
+          description: Уникальных мерчантов, затронутых правилом
+        shareOfDeclines:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Доля DECLINED транзакций, где это правило было среди matched
+
+    MerchantRiskStats:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/MerchantRiskRow' }
+
+    UserRiskProfile:
+      type: object
+      required: [userId, txCount_24h, gmv_24h, distinctDevices_24h, distinctIps_24h, distinctCities_24h, declineRate_30d]
+      properties:
+        userId:
+          type: string
+          format: uuid
+        txCount_24h:
+          type: integer
+          minimum: 0
+          description: Количество транзакций за последние 24 часа
+        gmv_24h:
+          type: number
+          format: double
+          minimum: 0
+          description: Сумма транзакций за последние 24 часа
+        distinctDevices_24h:
+          type: integer
+          minimum: 0
+          description: Уникальных устройств за последние 24 часа
+        distinctIps_24h:
+          type: integer
+          minimum: 0
+          description: Уникальных IP-адресов за последние 24 часа
+        distinctCities_24h:
+          type: integer
+          minimum: 0
+          description: Уникальных городов за последние 24 часа
+        declineRate_30d:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Доля отклонённых транзакций за последние 30 дней
+        lastSeenAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время последней активности
