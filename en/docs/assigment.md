@@ -100,6 +100,7 @@ may be ignored (`id`, `createdAt`, `updatedAt`, `traceId`, `timestamp` in errors
 | `DB_PASSWORD`    | PostgreSQL password    |
 | `REDIS_HOST`     | Redis host             |
 | `REDIS_PORT`     | Redis port             |
+| `RANDOM_SECRET`  | Character sequence for JWT key generation |
 
 ### JWT tokens
 

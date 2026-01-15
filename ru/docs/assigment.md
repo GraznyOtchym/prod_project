@@ -86,18 +86,19 @@
 
 ### Переменные окружения
 
-| Переменная       | Описание                  |
-|------------------|---------------------------|
-| `ADMIN_EMAIL`    | Email администратора      |
-| `ADMIN_FULLNAME` | Полное имя администратора |
-| `ADMIN_PASSWORD` | Пароль администратора     |
-| `DB_HOST`        | Хост PostgreSQL           |
-| `DB_PORT`        | Порт PostgreSQL           |
-| `DB_NAME`        | Имя базы данных           |
-| `DB_USER`        | Логин PostgreSQL          |
-| `DB_PASSWORD`    | Пароль PostgreSQL         |
-| `REDIS_HOST`     | Хост Redis                |
-| `REDIS_PORT`     | Порт Redis                |
+| Переменная       | Описание                                            |
+|------------------|-----------------------------------------------------|
+| `ADMIN_EMAIL`    | Email администратора                                |
+| `ADMIN_FULLNAME` | Полное имя администратора                           |
+| `ADMIN_PASSWORD` | Пароль администратора                               | 
+| `RANDOM_SECRET`  | Последовательность символов для генерации JWT ключа |
+| `DB_HOST`        | Хост PostgreSQL                                     |
+| `DB_PORT`        | Порт PostgreSQL                                     |
+| `DB_NAME`        | Имя базы данных                                     |
+| `DB_USER`        | Логин PostgreSQL                                    |
+| `DB_PASSWORD`    | Пароль PostgreSQL                                   |
+| `REDIS_HOST`     | Хост Redis                                          |
+| `REDIS_PORT`     | Порт Redis                                          |
 
 ### JWT-токены
 
@@ -346,7 +347,7 @@
 | `fullName`      | string             | 2—200 символов, не может быть `null`       |
 | `age`           | integer или `null` | 18—120                                     |
 | `region`        | string или `null`  | максимум 32 символа                        |
-| `gender`        | string или `null`  | `MALE`, `FEMALE`, `OTHER`                  |
+| `gender`        | string или `null`  | `MALE`, `FEMALE`                           |
 | `maritalStatus` | string или `null`  | `SINGLE`, `MARRIED`, `DIVORCED`, `WIDOWED` |
 
 > **Важно!** ADMIN при обновлении может также передавать `role` и `isActive`.
