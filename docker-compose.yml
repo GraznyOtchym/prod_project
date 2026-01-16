@@ -9,7 +9,7 @@ services:
     env_file:
       - .env
     environment:
-      - DB_HOST=db 
+      - DB_HOST=db
       - REDIS_HOST=redis
     depends_on:
       db:
@@ -20,12 +20,14 @@ services:
   db:
     image: postgres:16.6-alpine
     container_name: prod_db
+    ports:
+      - "5432:5432"
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=anti_fraud
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d anti_fraud"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
       interval: 5s
       timeout: 5s
       retries: 5

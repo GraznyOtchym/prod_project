@@ -2,9 +2,10 @@ fastapi[standard]
 pydantic-settings
 sqlalchemy[asyncio]
 asyncpg
-fastapi-users[sqlalchemy]
 python-jose[cryptography]
-passlib[bcrypt]
 redis
 httpx
 python-multipart
+argon2-cffi
+authx
+pwdlib
