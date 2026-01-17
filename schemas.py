@@ -12,6 +12,11 @@ class Gender(str, Enum):
     FEMALE = "FEMALE"
 
 
+class Role(str, Enum):
+    ADMIN = "ADMIN"
+    USER = "USER"
+
+
 class MaritalStatus(str, Enum):
     SINGLE = "SINGLE"
     MARRIED = "MARRIED"
@@ -20,7 +25,7 @@ class MaritalStatus(str, Enum):
 
 
 class UserCreate(BaseModel):
-    email: EmailStr = Field(..., max_length=254, alias="e-mail")
+    email: EmailStr = Field(..., max_length=254, alias="email")
     password: str = Field(..., min_length=8, max_length=72)
     full_name: str = Field(..., min_length=2, max_length=200, alias="fullName")
     age: Optional[int] = Field(None, ge=18, le=120)
@@ -61,3 +66,13 @@ class AuthResponse(BaseModel):
     access_token: str = Field(..., alias="accessToken")
     expires_in: int = Field(3600, alias="expiresIn")
     user: UserResponse
+
+
+class UserUpdate(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=200, alias="fullName")
+    age: Optional[int] = Field(..., ge=18, le=120)
+    region: Optional[str] = Field(..., max_length=32)
+    gender: Optional[Gender] = Field(...)
+    marital_status: Optional[MaritalStatus] = Field(..., alias="maritalStatus")
+
+    model_config = ConfigDict(populate_by_name=True)
