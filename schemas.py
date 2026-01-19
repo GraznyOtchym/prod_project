@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+shared_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
 
 class Gender(str, Enum):
     MALE = "MALE"
@@ -41,6 +43,10 @@ class UserCreate(BaseModel):
         return v
 
 
+class AdminCreate(UserCreate):
+    role: Role
+
+
 class UserLogin(BaseModel):
     email: EmailStr = Field(..., max_length=254)
     password: str = Field(..., min_length=8, max_length=72)
@@ -54,7 +60,7 @@ class UserResponse(BaseModel):
     region: Optional[str] = None
     gender: Optional[Gender] = None
     marital_status: Optional[MaritalStatus] = Field(None, alias="maritalStatus")
-    role: str
+    role: Role
     is_active: bool = Field(..., alias="isActive")
     created_at: datetime = Field(..., alias="createdAt")
     updated_at: datetime = Field(..., alias="updatedAt")
@@ -75,4 +81,41 @@ class UserUpdate(BaseModel):
     gender: Optional[Gender] = Field(...)
     marital_status: Optional[MaritalStatus] = Field(..., alias="maritalStatus")
 
+    model_config = shared_config
+
+
+# 00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+
+
+class FraudRuleBase(BaseModel):
+    name: str = Field(..., min_length=3, max_length=120)
+    description: Optional[str] = Field(None, max_length=500)
+    dsl_expression: str = Field(
+        ..., min_length=3, max_length=2000, alias="dslExpression"
+    )
+    enabled: bool = Field(True)
+    priority: int = Field(100, ge=1)
+
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
+
+
+class FraudRuleCreate(FraudRuleBase):
+    pass
+
+
+class FraudRuleUpdate(BaseModel):
+    name: str = Field(..., min_length=3, max_length=120)
+    description: Optional[str] = Field(..., max_length=500)
+    dsl_expression: str = Field(
+        ..., min_length=3, max_length=2000, alias="dslExpression"
+    )
+    enabled: bool = Field(...)
+    priority: int = Field(..., ge=1)
+
     model_config = ConfigDict(populate_by_name=True)
+
+
+class FraudRuleResponse(FraudRuleBase):
+    id: UUID
+    created_at: datetime = Field(..., alias="createdAt")
+    updated_at: datetime = Field(..., alias="updatedAt")
