@@ -76,15 +76,12 @@ class AuthResponse(BaseModel):
 
 class UserUpdate(BaseModel):
     full_name: str = Field(..., min_length=2, max_length=200, alias="fullName")
-    age: Optional[int] = Field(..., ge=18, le=120)
-    region: Optional[str] = Field(..., max_length=32)
-    gender: Optional[Gender] = Field(...)
-    marital_status: Optional[MaritalStatus] = Field(..., alias="maritalStatus")
+    age: int | None = Field(default=None, ge=18, le=120)
+    region: str | None = Field(default=None, max_length=32)
+    gender: Gender | None = None
+    marital_status: MaritalStatus | None = Field(default=None, alias="maritalStatus")
 
     model_config = shared_config
-
-
-# 00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 
 
 class FraudRuleBase(BaseModel):

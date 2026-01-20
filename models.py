@@ -1,7 +1,19 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
+from typing import Any, Optional
 
-from sqlalchemy import UUID, Boolean, DateTime, Integer, String, Text, func
+from sqlalchemy import (
+    JSON,
+    UUID,
+    Boolean,
+    DateTime,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db import Base
@@ -10,7 +22,9 @@ from db import Base
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     email: Mapped[str] = mapped_column(
         String(254), unique=True, index=True, nullable=False
     )
@@ -44,3 +58,26 @@ class FraudRule(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(precision=19, scale=2))
+    currency: Mapped[str] = mapped_column(String(3))
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    merchant_id: Mapped[str | None] = mapped_column(String(64))
+    merchant_category_code: Mapped[str | None] = mapped_column(String(4))
+    ip_address: Mapped[str | None] = mapped_column(String(64))
+    device_id: Mapped[str | None] = mapped_column(String(128))
+    channel: Mapped[str | None] = mapped_column(String(20))
+
+    location: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    extra_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column("metadata", JSON)
+
+    def __repr__(self) -> str:
+        return f"<Transaction {self.id} | {self.amount} {self.currency}>"
