@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import settings
 from db import Base, Session, async_engine, get_session
 from models import User
-from routers import api_users, fraud_rules
+from routers import api_users, fraud_rules, transactions
 from schemas import AuthResponse, UserCreate, UserLogin
 
 password_hash = PasswordHash.recommended()
@@ -64,6 +64,7 @@ app = FastAPI(lifespan=lifespan, swagger_ui_parameters={"persistAuthorization": 
 
 app.include_router(api_users.router)
 app.include_router(fraud_rules.router)
+app.include_router(transactions.router)
 
 
 @app.middleware("http")

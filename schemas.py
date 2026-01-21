@@ -1,10 +1,18 @@
 import re
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 shared_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
@@ -116,3 +124,84 @@ class FraudRuleResponse(FraudRuleBase):
     id: UUID
     created_at: datetime = Field(..., alias="createdAt")
     updated_at: datetime = Field(..., alias="updatedAt")
+
+
+class TransactionChannel(str, Enum):
+    WEB = "WEB"
+    MOBILE = "MOBILE"
+    POS = "POS"
+    OTHER = "OTHER"
+
+
+class TransactionStatus(str, Enum):
+    APPROVED = "APPROVED"
+    DECLINED = "DECLINED"
+
+
+class LocationBase(BaseModel):
+    country: str = Field(min_length=2, max_length=2, pattern="^[A-Z]{2}$")
+    city: str = Field(max_length=128)
+    latitude: float | None = Field(None, ge=-90, le=90)
+    longitude: float | None = Field(None, ge=-180, le=180)
+
+    @model_validator(mode="after")
+    def check_lat_lng_pair(self) -> "LocationBase":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be provided together")
+        return self
+
+
+class TransactionCreate(BaseModel):
+    user_id: UUID | None = Field(None, alias="userId")
+    amount: Decimal = Field(ge=0.01, le=999999999.99)
+    currency: str = Field(pattern="^[A-Z]{3}$")
+    timestamp: datetime
+    merchant_id: str | None = Field(None, max_length=64, alias="merchantId")
+    merchant_category_code: str | None = Field(
+        None, pattern="^[0-9]{4}$", alias="merchantCategoryCode"
+    )
+    ip_address: str | None = Field(None, max_length=64, alias="ipAddress")
+    device_id: str | None = Field(None, max_length=128, alias="deviceId")
+    channel: TransactionChannel | None = None
+    location: LocationBase | None = None
+    metadata: dict[str, Any] | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RuleResultResponse(BaseModel):
+    rule_id: UUID = Field(alias="ruleId")
+    rule_name: str = Field(alias="ruleName")
+    priority: int
+    enabled: bool
+    matched: bool
+    description: str
+
+
+class TransactionResponseFields(BaseModel):
+    id: UUID
+    user_id: UUID = Field(alias="userId")
+    amount: Decimal
+    currency: str = Field(pattern="^[A-Z]{3}$")
+    status: TransactionStatus
+    merchant_id: str | None = Field(None, alias="merchantId")
+    merchant_category_code: str | None = Field(
+        None, pattern="^[0-9]{4}$", alias="merchantCategoryCode"
+    )
+    timestamp: datetime
+    ip_address: str | None = Field(None, alias="ipAddress")
+    device_id: str | None = Field(None, alias="deviceId")
+    channel: TransactionChannel | None = None
+    location: LocationBase | None = None
+    is_fraud: bool = Field(alias="isFraud")
+    metadata: dict[str, Any] | None = None
+    created_at: datetime = Field(alias="createdAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TransactionCreateResponse(BaseModel):
+    transaction: TransactionResponseFields
+    rule_results: list[RuleResultResponse] = Field(alias="ruleResults")
+
+    model_config = ConfigDict(populate_by_name=True)

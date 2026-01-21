@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy import (
     JSON,
@@ -76,8 +76,8 @@ class Transaction(Base):
     device_id: Mapped[str | None] = mapped_column(String(128))
     channel: Mapped[str | None] = mapped_column(String(20))
 
-    location: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
-    extra_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column("metadata", JSON)
+    location: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    extra_metadata: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON)
 
     def __repr__(self) -> str:
         return f"<Transaction {self.id} | {self.amount} {self.currency}>"
