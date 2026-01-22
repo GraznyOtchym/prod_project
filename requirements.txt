@@ -10,3 +10,4 @@ argon2-cffi
 authx
 pwdlib
 greenlet
+lark

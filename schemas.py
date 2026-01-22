@@ -126,6 +126,23 @@ class FraudRuleResponse(FraudRuleBase):
     updated_at: datetime = Field(..., alias="updatedAt")
 
 
+class DSLValidateRequest(BaseModel):
+    dsl_expression: str = Field(..., alias="dslExpression")
+
+
+class DSLError(BaseModel):
+    code: str
+    message: str
+    position: int | None = None
+    near: str | None = None
+
+
+class DSLValidationResponse(BaseModel):
+    is_valid: bool = Field(..., alias="isValid")
+    normalized_expression: str | None = Field(None, alias="normalizedExpression")
+    errors: list[DSLError] = []
+
+
 class TransactionChannel(str, Enum):
     WEB = "WEB"
     MOBILE = "MOBILE"

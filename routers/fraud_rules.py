@@ -9,8 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from db import get_session
+from dsl2 import validate_dsl_logic
 from models import FraudRule, User
 from schemas import (
+    DSLError,
+    DSLValidateRequest,
+    DSLValidationResponse,
     FraudRuleCreate,
     FraudRuleResponse,
     FraudRuleUpdate,
@@ -149,6 +153,22 @@ async def deactivate_fraud_rule(
     return JSONResponse(status_code=204, content=None)
 
 
-@router.post("/validate")
-async def validate_rule_stub():
-    raise HTTPException(status_code=422, detail="DSL_UNSUPPORTED_TIER")
+@router.post("/validate", response_model=DSLValidationResponse)
+async def validate_fraud_rule(payload: DSLValidateRequest):
+    dsl = payload.dsl_expression
+
+    if len(dsl) < 3 or len(dsl) > 2000:
+        return DSLValidationResponse(
+            isValid=False,
+            normalizedExpression=None,
+            errors=[
+                DSLError(
+                    code="DSL_PARSE_ERROR",
+                    message="Длина выражения должна быть от 3 до 2000 символов",
+                    position=0,
+                    near=dsl[:10] if dsl else "",
+                )
+            ],
+        )
+
+    return validate_dsl_logic(dsl)

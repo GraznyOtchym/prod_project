@@ -1,9 +1,9 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from authx import AuthX, AuthXConfig, RequestToken
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
@@ -14,6 +14,8 @@ from schemas import (
     Role,
     TransactionCreate,
     TransactionCreateResponse,
+    TransactionResponseFields,
+    TransactionStatus,
 )
 
 config = AuthXConfig(
@@ -145,9 +147,81 @@ async def create_transaction(
     }
 
 
-@router.get("")
-async def get_transactions():
-    pass
+@router.get("", response_model=list[TransactionResponseFields])
+async def get_transactions(
+    user_id: uuid.UUID | None = Query(None, alias="userId"),
+    status: TransactionStatus | None = None,
+    is_fraud: bool | None = Query(None, alias="isFraud"),
+    date_from: datetime | None = Query(None, alias="from"),
+    date_to: datetime | None = Query(None, alias="to"),
+    page: int = Query(0, ge=0),
+    size: int = Query(20, ge=1, le=100),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    now = datetime.now(timezone.utc)
+
+    if date_to is None:
+        date_to = now
+    if date_from is None:
+        date_from = date_to - timedelta(days=90)
+
+    if date_from >= date_to:
+        raise HTTPException(status_code=422, detail="from must be less than to")
+
+    if (date_to - date_from) > timedelta(days=90):
+        raise HTTPException(
+            status_code=422, detail="period between from and to cannot exceed 90 days"
+        )
+
+    query = select(Transaction)
+
+    if user.role != Role.ADMIN:
+        query = query.where(Transaction.user_id == user.id)
+    elif user_id:
+        query = query.where(Transaction.user_id == user_id)
+
+    query = query.where(
+        and_(Transaction.timestamp >= date_from, Transaction.timestamp < date_to)
+    )
+
+    if status:
+        query = query.where(Transaction.extra_metadata["status"].astext == status.value)
+
+    if is_fraud is not None:
+        fraud_val = "true" if is_fraud else "false"
+        query = query.where(Transaction.extra_metadata["isFraud"].astext == fraud_val)
+
+    query = query.order_by(Transaction.timestamp.desc())
+    query = query.offset(page * size).limit(size)
+
+    result = await session.execute(query)
+    transactions = result.scalars().all()
+
+    response = []
+    for tx in transactions:
+        meta = tx.extra_metadata or {}
+        response.append(
+            {
+                "id": tx.id,
+                "userId": tx.user_id,
+                "amount": tx.amount,
+                "currency": tx.currency,
+                "status": meta.get("status"),
+                "merchantId": tx.merchant_id,
+                "merchantCategoryCode": tx.merchant_category_code,
+                "timestamp": tx.timestamp,
+                "ipAddress": tx.ip_address,
+                "deviceId": tx.device_id,
+                "channel": tx.channel,
+                "location": tx.location,
+                "isFraud": meta.get("isFraud", False),
+                "metadata": meta.get("user_metadata"),
+                "createdAt": meta.get("createdAt"),
+            }
+        )
+
+    return response
 
 
 @router.get("/{id}", response_model=TransactionCreateResponse)
