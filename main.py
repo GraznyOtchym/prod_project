@@ -1,7 +1,6 @@
-import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 from authx import AuthX, AuthXConfig, RequestToken
 from authx.exceptions import JWTDecodeError, MissingTokenError
@@ -15,7 +14,7 @@ from config import settings
 from db import Base, Session, async_engine, get_session
 from models import User
 from routers import api_users, fraud_rules, transactions
-from schemas import AuthResponse, UserCreate, UserLogin
+from schemas import AuthResponse, Role, UserCreate, UserLogin
 
 password_hash = PasswordHash.recommended()
 
@@ -38,70 +37,66 @@ async def lifespan(app: FastAPI):
         result = await session.execute(
             select(User).where(User.email == settings.admin_email)
         )
-        admin_check = result.scalars().first()
-
-        if not admin_check:
+        if not result.scalars().first():
             new_admin = User(
                 email=settings.admin_email,
                 full_name=settings.admin_fullname,
                 hashed_password=password_hash.hash(settings.admin_password),
-                role="ADMIN",
+                role=Role.ADMIN,
                 is_active=True,
-                age=None,
-                region=None,
-                gender=None,
-                marital_status=None,
             )
             session.add(new_admin)
             await session.commit()
-
     yield
-
     await async_engine.dispose()
 
 
-app = FastAPI(lifespan=lifespan, swagger_ui_parameters={"persistAuthorization": True})
+app = FastAPI(
+    title="Anti-fraud Service",
+    lifespan=lifespan,
+    swagger_ui_parameters={"persistAuthorization": True},
+)
 
 app.include_router(api_users.router)
 app.include_router(fraud_rules.router)
 app.include_router(transactions.router)
 
 
-@app.middleware("http")
-async def test_middleware(request: Request, next_call):
-    start = time.time()
-
-    result = await next_call(request)
-
-    result.headers["time"] = str(time.time() - start)
-
-    return result
+def error_response(status_code: int, code: str, message: str, path: str):
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "code": code,
+            "message": message,
+            "traceId": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "path": path,
+        },
+    )
 
 
 @app.exception_handler(JWTDecodeError)
-async def authx_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=401,
-        content={"detail": "your token is invalid, try again"},
+async def authx_exception_handler(request: Request, exc):
+    return error_response(
+        401, "INVALID_TOKEN", "Token is invalid or expired", request.url.path
     )
 
 
 @app.exception_handler(MissingTokenError)
-async def authx_token_error_handler(request: Request, exc: MissingTokenError):
-    return JSONResponse(status_code=401, content={"detail": "Missing Bearer token"})
+async def authx_token_error_handler(request: Request, exc):
+    return error_response(
+        401, "MISSING_TOKEN", "Bearer token is required", request.url.path
+    )
 
 
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "code": "ERROR",
-            "message": exc.detail,
-            "traceId": str(uuid.uuid4()),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "path": request.url.path,
-        },
+    error_code = "ERROR"
+    if isinstance(exc.detail, str) and exc.detail.isupper():
+        error_code = exc.detail
+
+    return error_response(
+        exc.status_code, error_code, str(exc.detail), request.url.path
     )
 
 
@@ -110,21 +105,11 @@ async def get_current_user(
     session: AsyncSession = Depends(get_session),
 ):
     user = await session.get(User, uuid.UUID(token.sub))
-
     if not user:
-        raise HTTPException(status_code=404, detail="user is not found")
-
+        raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
     if not user.is_active:
-        raise HTTPException(status_code=423, detail="user is deactivated")
-
+        raise HTTPException(status_code=423, detail="USER_DEACTIVATED")
     return user
-
-
-async def is_admin(admin: User = Depends(get_current_user)):
-    if not admin.role == "ADMIN":
-        raise HTTPException(status_code=403, detail="forbidden")
-
-    return admin
 
 
 @app.get("/api/v1/ping")
@@ -135,10 +120,8 @@ async def ping():
 @app.post("/api/v1/auth/register", response_model=AuthResponse, status_code=201)
 async def registration(data: UserCreate, session: AsyncSession = Depends(get_session)):
     result = await session.execute(select(User).where(User.email == data.email))
-    check_user = result.scalars().first()
-
-    if check_user:
-        raise HTTPException(status_code=409, detail="email is occupied")
+    if result.scalars().first():
+        raise HTTPException(status_code=409, detail="EMAIL_ALREADY_EXISTS")
 
     new_user = User(
         email=data.email,
@@ -148,7 +131,7 @@ async def registration(data: UserCreate, session: AsyncSession = Depends(get_ses
         region=data.region,
         gender=data.gender,
         marital_status=data.marital_status,
-        role="USER",
+        role=Role.USER,
         is_active=True,
     )
 
@@ -156,26 +139,19 @@ async def registration(data: UserCreate, session: AsyncSession = Depends(get_ses
     await session.commit()
     await session.refresh(new_user)
 
-    access_token = auth.create_access_token(
-        uid=str(new_user.id), data={"role": new_user.role}
-    )
-
+    access_token = auth.create_access_token(uid=str(new_user.id), data={"role": "USER"})
     return {"accessToken": access_token, "expiresIn": 3600, "user": new_user}
 
 
 @app.post("/api/v1/auth/login", response_model=AuthResponse)
-async def login(
-    data: UserLogin,
-    session: AsyncSession = Depends(get_session),
-):
+async def login(data: UserLogin, session: AsyncSession = Depends(get_session)):
     user = await session.scalar(select(User).where(User.email == data.email))
 
     if not user or not password_hash.verify(data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="data is incorrect")
+        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
 
     if not user.is_active:
-        raise HTTPException(status_code=423, detail="user is deactivated")
+        raise HTTPException(status_code=423, detail="USER_DEACTIVATED")
 
     access_token = auth.create_access_token(uid=str(user.id), data={"role": user.role})
-
     return {"accessToken": access_token, "expiresIn": 3600, "user": user}

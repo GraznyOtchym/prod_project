@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -6,16 +7,16 @@ class Settings(BaseSettings):
     admin_fullname: str
     admin_password: str
 
-    db_host: str
-    db_port: int
-    db_name: str
-    db_user: str
-    db_password: str
+    db_host: str = "db"
+    db_port: int = 5432
+    db_name: str = "anti_fraud"
+    db_user: str = "postgres"
+    db_password: str = "postgres"
 
-    redis_host: str
-    redis_port: int
+    redis_host: str = "redis"
+    redis_port: int = 6379
 
-    random_secret: str
+    random_secret: str = Field(..., min_length=128, max_length=128)
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 

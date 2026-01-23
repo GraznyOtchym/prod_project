@@ -22,6 +22,8 @@ services:
     container_name: prod_db
     ports:
       - "5432:5432"
+    volumes:
+    - postgres_data:/var/lib/postgresql/data
     environment:
       - POSTGRES_USER=${DB_USER}
       - POSTGRES_PASSWORD=${DB_PASSWORD}
@@ -37,3 +39,6 @@ services:
     container_name: prod_redis
     ports:
       - "6379:6379"
+
+  volumes:
+    postgres_data:

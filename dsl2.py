@@ -2,6 +2,7 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from lark import Lark, Transformer, UnexpectedInput, UnexpectedToken, v_args
+from lark.exceptions import VisitError
 
 from schemas import DSLError, DSLValidationResponse
 
@@ -13,53 +14,103 @@ dsl_grammar = """
     ?not_expr: comparison
              | "NOT" not_expr -> not_expr
              | "(" expr ")"
-    ?comparison: num_comparison | str_comparison
-    num_comparison: num_field OP NUMBER
-    str_comparison: str_field STR_OP SQ_STRING
-    num_field: "amount" -> amount_field | "user.age" -> user_age_field
-    str_field: "currency" -> currency_field | "merchantId" -> merchant_id_field 
-             | "ipAddress" -> ip_address_field | "deviceId" -> device_id_field 
-             | "user.region" -> user_region_field
+    
+    comparison: field OP value
+
+    field: CNAME | CNAME "." CNAME
+    
+    ?value: NUMBER -> num_val 
+          | SQ_STRING -> str_val
+
     OP: ">=" | "<=" | ">" | "<" | "=" | "!="
-    STR_OP: "=" | "!="
     SQ_STRING: /'[^']*'/
+    
+    %import common.CNAME
     %import common.NUMBER
     %import common.WS
     %ignore WS
 """
 
+FIELD_CONFIG = {
+    "amount": {"type": "number"},
+    "user.age": {"type": "number"},
+    "currency": {"type": "string"},
+    "merchantId": {"type": "string"},
+    "ipAddress": {"type": "string"},
+    "deviceId": {"type": "string"},
+    "user.region": {"type": "string"},
+}
+
+
+class DSLSemanticError(Exception):
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
 
 class DSLTransformer(Transformer):
-    def amount_field(self, _):
-        return lambda t, u: t.amount
+    def __init__(self, check_semantics=False):
+        self.check_semantics = check_semantics
 
-    def user_age_field(self, _):
-        return lambda t, u: Decimal(str(u.age)) if u.age is not None else None
+    def field(self, items):
+        return "".join(t.value for t in items)
 
-    def currency_field(self, _):
-        return lambda t, u: str(t.currency)
+    def num_val(self, items):
+        return Decimal(items[0]), "number"
 
-    def merchant_id_field(self, _):
-        return lambda t, u: str(t.merchant_id)
-
-    def ip_address_field(self, _):
-        return lambda t, u: str(t.ip_address)
-
-    def device_id_field(self, _):
-        return lambda t, u: str(t.device_id)
-
-    def user_region_field(self, _):
-        return lambda t, u: str(u.region)
+    def str_val(self, items):
+        return items[0][1:-1], "string"
 
     @v_args(inline=True)
-    def num_comparison(self, field_getter, op, value):
-        val = Decimal(value.value)
+    def comparison(self, field_name, op, value_tuple):
+        val, val_type = value_tuple
         operator = op.value
 
+        if self.check_semantics:
+            if field_name not in FIELD_CONFIG:
+                raise DSLSemanticError(
+                    "DSL_INVALID_FIELD", f"Unknown field: {field_name}"
+                )
+
+            field_type = FIELD_CONFIG[field_name]["type"]
+
+            if field_type == "string" and operator not in ("=", "!="):
+                raise DSLSemanticError(
+                    "DSL_INVALID_OPERATOR",
+                    f"Operator {operator} not allowed for string field {field_name}",
+                )
+
+            if field_type != val_type:
+                raise DSLSemanticError(
+                    "DSL_INVALID_OPERATOR",
+                    f"Cannot compare {field_type} field with {val_type} value",
+                )
+
+            return True
+
+        getters = {
+            "amount": lambda t, u: t.amount,
+            "user.age": lambda t, u: Decimal(u.age)
+            if getattr(u, "age", None) is not None
+            else None,
+            "currency": lambda t, u: str(t.currency),
+            "merchantId": lambda t, u: getattr(t, "merchant_id", None),
+            "ipAddress": lambda t, u: getattr(t, "ip_address", None),
+            "deviceId": lambda t, u: getattr(t, "device_id", None),
+            "user.region": lambda t, u: getattr(u, "region", None),
+        }
+
+        getter = getters.get(field_name, lambda t, u: None)
+
         def compare(t, u):
-            actual = field_getter(t, u)
+            actual = getter(t, u)
             if actual is None:
                 return False
+
+            if val_type == "string":
+                actual = str(actual)
+
             if operator == ">":
                 return actual > val
             if operator == ">=":
@@ -76,55 +127,67 @@ class DSLTransformer(Transformer):
 
         return compare
 
-    @v_args(inline=True)
-    def str_comparison(self, field_getter, op, value):
-        val = value.value[1:-1]
-        operator = op.value
-
-        def compare(t, u):
-            actual = field_getter(t, u)
-            if actual is None:
-                return False
-            actual_str = str(actual)
-            return actual_str == val if operator == "=" else actual_str != val
-
-        return compare
-
     def not_expr(self, items):
+        if self.check_semantics:
+            return True
         inner = items[0]
         return lambda t, u: not inner(t, u)
 
     def and_expr(self, items):
+        if self.check_semantics:
+            return True
         left, right = items[0], items[1]
         return lambda t, u: left(t, u) and right(t, u)
 
     def or_expr(self, items):
+        if self.check_semantics:
+            return True
         left, right = items[0], items[1]
         return lambda t, u: left(t, u) or right(t, u)
 
 
-_EXECUTOR = Lark(dsl_grammar, parser="lalr", transformer=DSLTransformer())
-_VALIDATOR = Lark(dsl_grammar, parser="lalr")
+_VALIDATOR = Lark(
+    dsl_grammar, parser="lalr", transformer=DSLTransformer(check_semantics=True)
+)
+_EXECUTOR = Lark(
+    dsl_grammar, parser="lalr", transformer=DSLTransformer(check_semantics=False)
+)
 
 
 def validate_dsl_logic(expression: str) -> DSLValidationResponse:
+    if not expression or not expression.strip():
+        return DSLValidationResponse(
+            isValid=False,
+            normalizedExpression=None,
+            errors=[DSLError(code="DSL_PARSE_ERROR", message="Empty expression")],
+        )
+
     try:
         _VALIDATOR.parse(expression)
         return DSLValidationResponse(
             isValid=True, normalizedExpression=expression.strip(), errors=[]
         )
+
+    except VisitError as e:
+        orig = e.orig_exc
+        code = orig.code if isinstance(orig, DSLSemanticError) else "DSL_INTERNAL_ERROR"
+        return DSLValidationResponse(
+            isValid=False,
+            normalizedExpression=None,
+            errors=[DSLError(code=code, message=str(orig))],
+        )
+
     except (UnexpectedToken, UnexpectedInput) as e:
-        start = max(0, e.column - 5)
-        end = e.column + 5
-        context = expression[start:end]
+        col = getattr(e, "column", 0) or 0
+        context = expression[max(0, col - 5) : col + 5]
         return DSLValidationResponse(
             isValid=False,
             normalizedExpression=None,
             errors=[
                 DSLError(
                     code="DSL_PARSE_ERROR",
-                    message="Синтаксическая ошибка в выражении",
-                    position=e.column,
+                    message="Syntax Error",
+                    position=col,
                     near=context.strip(),
                 )
             ],

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -8,9 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from db import get_session
-from dsl import evaluate_rule
+from dsl2 import evaluate_rule
 from models import FraudRule, Transaction, User
 from schemas import (
+    BatchTransactions,
     Role,
     TransactionCreate,
     TransactionCreateResponse,
@@ -50,15 +52,7 @@ async def is_admin(admin: User = Depends(get_current_user)):
     return admin
 
 
-router = APIRouter(prefix="/api/v1/transactions", tags=["transactions"])
-
-
-@router.post("", response_model=TransactionCreateResponse, status_code=201)
-async def create_transaction(
-    data: TransactionCreate,
-    user: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
-):
+async def single_transaction(data, user, session):
     user_id = data.user_id if user.role == Role.ADMIN and data.user_id else user.id
 
     target_user = await session.get(User, user_id)
@@ -145,6 +139,18 @@ async def create_transaction(
         },
         "ruleResults": rule_results,
     }
+
+
+router = APIRouter(prefix="/api/v1/transactions", tags=["transactions"])
+
+
+@router.post("", response_model=TransactionCreateResponse, status_code=201)
+async def create_transaction(
+    data: TransactionCreate,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    return await single_transaction(data, user, session)
 
 
 @router.get("", response_model=list[TransactionResponseFields])
@@ -260,3 +266,18 @@ async def get_transaction_by_id(
         },
         "ruleResults": meta.get("ruleResults", []),
     }
+
+
+@router.post("/batch")
+async def create_batch(
+    data: BatchTransactions,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    transactions = data.items
+
+    tasks = [single_transaction(data, user, session) for data in transactions]
+    results = await asyncio.gather(*tasks)
+
+    await session.commit()
+    return {"items": results}

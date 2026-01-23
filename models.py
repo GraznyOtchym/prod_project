@@ -78,6 +78,3 @@ class Transaction(Base):
 
     location: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     extra_metadata: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON)
-
-    def __repr__(self) -> str:
-        return f"<Transaction {self.id} | {self.amount} {self.currency}>"

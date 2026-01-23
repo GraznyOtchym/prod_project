@@ -208,7 +208,7 @@ async def create_user(
     return new_user
 
 
-@router.delete("/api/v1/users/{id}")
+@router.delete("/{id}")
 async def deactivate_user(
     id: uuid.UUID,
     admin: User = Depends(is_admin),
