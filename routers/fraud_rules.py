@@ -1,16 +1,15 @@
 import uuid
+from typing import List
 
-from authx import AuthX, AuthXConfig, RequestToken
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
 from db import get_session
-from dsl2 import validate_dsl_logic
-from models import FraudRule, User
+from dependencies import is_admin
+from dsl import validate_dsl_logic
+from models import FraudRule
 from schemas import (
     DSLError,
     DSLValidateRequest,
@@ -19,38 +18,6 @@ from schemas import (
     FraudRuleResponse,
     FraudRuleUpdate,
 )
-
-config = AuthXConfig(
-    JWT_SECRET_KEY=settings.random_secret,
-    JWT_ALGORITHM="HS256",
-    JWT_TOKEN_LOCATION=["headers"],
-    JWT_ACCESS_TOKEN_EXPIRES=3600,
-)
-
-auth = AuthX(config=config)
-
-
-async def get_current_user(
-    token: RequestToken = Depends(auth.access_token_required),
-    session: AsyncSession = Depends(get_session),
-):
-    user = await session.get(User, uuid.UUID(token.sub))
-
-    if not user:
-        raise HTTPException(status_code=404, detail="user is not found")
-
-    if not user.is_active:
-        raise HTTPException(status_code=423, detail="user is deactivated")
-
-    return user
-
-
-async def is_admin(admin: User = Depends(get_current_user)):
-    if not admin.role == "ADMIN":
-        raise HTTPException(status_code=403, detail="forbidden")
-
-    return admin
-
 
 router = APIRouter(
     prefix="/api/v1/fraud-rules", tags=["fraud-rules"], dependencies=[Depends(is_admin)]
@@ -63,10 +30,8 @@ async def create_fraud_rule(
     session: AsyncSession = Depends(get_session),
 ):
     result = await session.execute(select(FraudRule).where(FraudRule.name == data.name))
-    check_rule = result.scalars().first()
-
-    if check_rule:
-        raise HTTPException(status_code=409, detail="rule is occupied")
+    if result.scalars().first():
+        raise HTTPException(status_code=409, detail="RULE_ALREADY_EXISTS")
 
     new_rule = FraudRule(
         name=data.name,
@@ -79,16 +44,13 @@ async def create_fraud_rule(
     session.add(new_rule)
     await session.commit()
     await session.refresh(new_rule)
-
     return new_rule
 
 
-@router.get("")
+@router.get("", response_model=List[FraudRuleResponse])
 async def get_fraud_rules(session: AsyncSession = Depends(get_session)):
-    result = await session.execute(select(FraudRule))
-    rules = result.scalars().all()
-
-    return rules
+    result = await session.execute(select(FraudRule).order_by(FraudRule.priority.asc()))
+    return result.scalars().all()
 
 
 @router.get("/{id}", response_model=FraudRuleResponse)
@@ -97,10 +59,8 @@ async def get_fraud_rule_by_id(
     session: AsyncSession = Depends(get_session),
 ):
     rule = await session.get(FraudRule, id)
-
     if not rule:
-        raise HTTPException(status_code=404, detail="rule is not found")
-
+        raise HTTPException(status_code=404, detail="RULE_NOT_FOUND")
     return rule
 
 
@@ -113,27 +73,26 @@ async def update_fraud_rule(
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="invalid json")
+        raise HTTPException(status_code=400, detail="INVALID_JSON")
 
-    rule_to_update = await session.get(FraudRule, id)
-    if not rule_to_update:
-        raise HTTPException(status_code=404, detail="rule is not found")
+    rule = await session.get(FraudRule, id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="RULE_NOT_FOUND")
 
     try:
         data = FraudRuleUpdate(**body)
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors())
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="VALIDATION_FAILED")
 
-    rule_to_update.name = data.name
-    rule_to_update.description = data.description
-    rule_to_update.dsl_expression = data.dsl_expression
-    rule_to_update.enabled = data.enabled
-    rule_to_update.priority = data.priority
+    rule.name = data.name
+    rule.description = data.description
+    rule.dsl_expression = data.dsl_expression
+    rule.enabled = data.enabled
+    rule.priority = data.priority
 
     await session.commit()
-    await session.refresh(rule_to_update)
-
-    return rule_to_update
+    await session.refresh(rule)
+    return rule
 
 
 @router.delete("/{id}", status_code=204)
@@ -142,15 +101,12 @@ async def deactivate_fraud_rule(
     session: AsyncSession = Depends(get_session),
 ):
     rule = await session.get(FraudRule, id)
-
     if not rule:
-        raise HTTPException(status_code=404, detail="rule is not found")
+        raise HTTPException(status_code=404, detail="RULE_NOT_FOUND")
 
-    if rule.enabled:
-        rule.enabled = False
-        await session.commit()
-
-    return JSONResponse(status_code=204, content=None)
+    rule.enabled = False
+    await session.commit()
+    return None
 
 
 @router.post("/validate", response_model=DSLValidationResponse)

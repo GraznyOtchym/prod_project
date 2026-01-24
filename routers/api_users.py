@@ -1,66 +1,22 @@
 import uuid
 
-from authx import AuthX, AuthXConfig, RequestToken
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
 from pwdlib import PasswordHash
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
 from db import get_session
+from dependencies import get_current_user, is_admin
 from models import User
-from schemas import (
-    AdminCreate,
-    UserResponse,
-    UserUpdate,
-)
+from schemas import AdminCreate, Role, UserList, UserResponse, UserUpdate
 
-config = AuthXConfig(
-    JWT_SECRET_KEY=settings.random_secret,
-    JWT_ALGORITHM="HS256",
-    JWT_TOKEN_LOCATION=["headers"],
-    JWT_ACCESS_TOKEN_EXPIRES=3600,
-)
-
-auth = AuthX(config=config)
 password_hash = PasswordHash.recommended()
-
-
-async def get_current_user(
-    token: RequestToken = Depends(auth.access_token_required),
-    session: AsyncSession = Depends(get_session),
-):
-    user = await session.get(User, uuid.UUID(token.sub))
-
-    if not user:
-        raise HTTPException(status_code=404, detail="user is not found")
-
-    if not user.is_active:
-        raise HTTPException(status_code=423, detail="user is deactivated")
-
-    return user
-
-
-async def is_admin(admin: User = Depends(get_current_user)):
-    if not admin.role == "ADMIN":
-        raise HTTPException(status_code=403, detail="forbidden")
-
-    return admin
-
-
 router = APIRouter(prefix="/api/v1/users", tags=["users"])
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_me(
-    token: RequestToken = Depends(auth.access_token_required),
-    db: AsyncSession = Depends(get_session),
-):
-    user = await db.get(User, uuid.UUID(token.sub))
-    if not user:
-        raise HTTPException(status_code=404, detail="user is not found")
+async def get_me(user: User = Depends(get_current_user)):
     return user
 
 
@@ -73,17 +29,16 @@ async def update_me(
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="invalid json")
+        raise HTTPException(status_code=400, detail="BAD_REQUEST")
 
-    if user.role != "ADMIN":
+    if user.role != Role.ADMIN:
         if "role" in body or "isActive" in body:
-            raise HTTPException(
-                status_code=403, detail="Users cannot update role or isActive status"
-            )
+            raise HTTPException(status_code=403, detail="FORBIDDEN")
+
     try:
         data = UserUpdate(**body)
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="VALIDATION_FAILED")
 
     user.full_name = data.full_name
     user.age = data.age
@@ -91,7 +46,7 @@ async def update_me(
     user.gender = data.gender
     user.marital_status = data.marital_status
 
-    if user.role == "ADMIN":
+    if user.role == Role.ADMIN:
         if "role" in body:
             user.role = body["role"]
         if "isActive" in body:
@@ -108,12 +63,12 @@ async def get_user(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    if current_user.role != "ADMIN" and current_user.id != id:
-        raise HTTPException(status_code=403, detail="forbidden")
+    if current_user.role != Role.ADMIN and current_user.id != id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
 
     user = await session.get(User, id)
     if not user:
-        raise HTTPException(status_code=404, detail="user is not found")
+        raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
 
     return user
 
@@ -122,37 +77,30 @@ async def get_user(
 async def update_user(
     id: uuid.UUID,
     request: Request,
-    user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
+    user_to_update = await session.get(User, id)
+    if not user_to_update:
+        raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+
+    if current_user.role != Role.ADMIN and current_user.id != id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="invalid json")
+        raise HTTPException(status_code=400, detail="BAD_REQUEST")
 
-    user_to_update = await session.get(User, id)
-    if not user_to_update:
-        raise HTTPException(status_code=404, detail="user is not found")
+    if current_user.role != Role.ADMIN and ("role" in body or "isActive" in body):
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
 
-    if user.role != "ADMIN" and user.id != id:
-        raise HTTPException(status_code=403, detail="forbidden")
+    data = UserUpdate(**body)
 
-    if user.role != "ADMIN":
-        if "role" in body or "isActive" in body:
-            raise HTTPException(status_code=403, detail="forbidden")
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(user_to_update, field, value)
 
-    try:
-        data = UserUpdate(**body)
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors())
-
-    user_to_update.full_name = data.full_name
-    user_to_update.age = data.age
-    user_to_update.region = data.region
-    user_to_update.gender = data.gender
-    user_to_update.marital_status = data.marital_status
-
-    if user.role == "ADMIN":
+    if current_user.role == Role.ADMIN:
         if "role" in body:
             user_to_update.role = body["role"]
         if "isActive" in body:
@@ -163,19 +111,18 @@ async def update_user(
     return user_to_update
 
 
-@router.get("")
+@router.get("", response_model=UserList)
 async def user_list(
-    page: int = Query(0),
+    page: int = Query(0, ge=0),
     size: int = Query(20, ge=1, le=100),
     admin: User = Depends(is_admin),
     session: AsyncSession = Depends(get_session),
 ):
-    stmt = select(func.count(User.id))
-    result = await session.execute(stmt)
-    total = result.scalar()
+    total = await session.scalar(select(func.count(User.id)))
 
-    stmt = select(User).offset(page * size).limit(size)
-    result = await session.execute(stmt)
+    result = await session.execute(
+        select(User).order_by(User.created_at).offset(page * size).limit(size)
+    )
     users = result.scalars().all()
 
     return {"items": users, "total": total, "page": page, "size": size}
@@ -189,7 +136,7 @@ async def create_user(
 ):
     check = await session.scalar(select(User).where(User.email == data.email))
     if check:
-        raise HTTPException(status_code=409, detail="email is occupied")
+        raise HTTPException(status_code=409, detail="EMAIL_ALREADY_EXISTS")
 
     new_user = User(
         email=data.email,
@@ -199,7 +146,7 @@ async def create_user(
         region=data.region,
         gender=data.gender,
         marital_status=data.marital_status,
-        role=data.role.value,
+        role=data.role,
         is_active=True,
     )
     session.add(new_user)
@@ -208,19 +155,18 @@ async def create_user(
     return new_user
 
 
-@router.delete("/{id}")
+@router.delete("/{id}", status_code=204)
 async def deactivate_user(
     id: uuid.UUID,
     admin: User = Depends(is_admin),
     session: AsyncSession = Depends(get_session),
 ):
     user = await session.get(User, id)
-
     if not user:
-        raise HTTPException(status_code=404, detail="user is not found")
+        raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
 
     if user.is_active:
         user.is_active = False
         await session.commit()
 
-    return JSONResponse(status_code=204, content=None)
+    return None

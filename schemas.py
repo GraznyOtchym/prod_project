@@ -99,6 +99,13 @@ class UserUpdate(BaseModel):
     model_config = shared_config
 
 
+class UserList(BaseModel):
+    items: list[UserResponse]
+    total: int
+    page: int
+    size: int
+
+
 class AuthResponse(BaseModel):
     access_token: str = Field(..., alias="accessToken")
     expires_in: int = Field(3600, alias="expiresIn")
@@ -224,3 +231,61 @@ class TransactionCreateResponse(BaseModel):
 
 class BatchTransactions(BaseModel):
     items: list[TransactionCreate]
+
+
+class MerchantRiskRow(BaseModel):
+    merchantId: str | None
+    merchantCategoryCode: str | None
+    txCount: int
+    gmv: float
+    declineRate: float
+
+
+class StatsOverview(BaseModel):
+    from_: datetime = Field(..., alias="from")
+    to: datetime
+    volume: int
+    gmv: float
+    approvalRate: float
+    declineRate: float
+    topRiskMerchants: list[MerchantRiskRow]
+
+
+class TransactionsTimePoint(BaseModel):
+    bucketStart: datetime
+    txCount: int
+    gmv: float
+    approvalRate: float
+    declineRate: float
+
+
+class TransactionsTimeSeries(BaseModel):
+    points: list[TransactionsTimePoint]
+
+
+class RuleMatchRow(BaseModel):
+    ruleId: str
+    ruleName: str
+    matches: int
+    uniqueUsers: int
+    uniqueMerchants: int
+    shareOfDeclines: float
+
+
+class RuleMatchStats(BaseModel):
+    items: list[RuleMatchRow]
+
+
+class MerchantRiskStats(BaseModel):
+    items: list[MerchantRiskRow]
+
+
+class UserRiskProfile(BaseModel):
+    userId: str
+    txCount_24h: int
+    gmv_24h: float
+    distinctDevices_24h: int
+    distinctIps_24h: int
+    distinctCities_24h: int
+    declineRate_30d: float
+    lastSeenAt: datetime | None

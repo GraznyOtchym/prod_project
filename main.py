@@ -2,18 +2,20 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from authx import AuthX, AuthXConfig, RequestToken
+from authx import AuthX, AuthXConfig
 from authx.exceptions import JWTDecodeError, MissingTokenError
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pwdlib import PasswordHash
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from config import settings
 from db import Base, Session, async_engine, get_session
 from models import User
-from routers import api_users, fraud_rules, transactions
+from routers import api_users, fraud_rules, stats, transactions
 from schemas import AuthResponse, Role, UserCreate, UserLogin
 
 password_hash = PasswordHash.recommended()
@@ -52,7 +54,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Anti-fraud Service",
     lifespan=lifespan,
     swagger_ui_parameters={"persistAuthorization": True},
 )
@@ -60,6 +61,7 @@ app = FastAPI(
 app.include_router(api_users.router)
 app.include_router(fraud_rules.router)
 app.include_router(transactions.router)
+app.include_router(stats.router)
 
 
 def error_response(status_code: int, code: str, message: str, path: str):
@@ -78,14 +80,14 @@ def error_response(status_code: int, code: str, message: str, path: str):
 @app.exception_handler(JWTDecodeError)
 async def authx_exception_handler(request: Request, exc):
     return error_response(
-        401, "INVALID_TOKEN", "Token is invalid or expired", request.url.path
+        401, "INVALID_TOKEN", "token is invalid or expired", request.url.path
     )
 
 
 @app.exception_handler(MissingTokenError)
 async def authx_token_error_handler(request: Request, exc):
     return error_response(
-        401, "MISSING_TOKEN", "Bearer token is required", request.url.path
+        401, "MISSING_TOKEN", "bearer token is required", request.url.path
     )
 
 
@@ -100,16 +102,71 @@ async def custom_http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
-async def get_current_user(
-    token: RequestToken = Depends(auth.access_token_required),
-    session: AsyncSession = Depends(get_session),
-):
-    user = await session.get(User, uuid.UUID(token.sub))
-    if not user:
-        raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
-    if not user.is_active:
-        raise HTTPException(status_code=423, detail="USER_DEACTIVATED")
-    return user
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    if any(
+        err.get("type") in ("json_invalid", "value_error.jsondecode") for err in errors
+    ):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "code": "BAD_REQUEST",
+                "message": "bad json",
+                "traceId": str(uuid.uuid4()),
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "path": request.url.path,
+            },
+        )
+    field_errors = []
+    for error in errors:
+        is_missing = error["type"] == "missing"
+        field_errors.append(
+            {
+                "field": str(error["loc"][-1]),
+                "issue": error["msg"],
+                "rejectedValue": None if is_missing else error.get("input"),
+            }
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "code": "VALIDATION_FAILED",
+            "message": "validation failed for some fields",
+            "traceId": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "path": request.url.path,
+            "fieldErrors": field_errors,
+        },
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if exc.status_code == 400:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "BAD_REQUEST",
+                "message": "bad json",
+                "traceId": str(uuid.uuid4()),
+                "timestamp": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "path": request.url.path,
+            },
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": str(exc.detail),
+            "message": str(exc.detail),
+            "traceId": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "path": request.url.path,
+        },
+    )
 
 
 @app.get("/api/v1/ping")
@@ -148,10 +205,10 @@ async def login(data: UserLogin, session: AsyncSession = Depends(get_session)):
     user = await session.scalar(select(User).where(User.email == data.email))
 
     if not user or not password_hash.verify(data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+        raise HTTPException(status_code=401, detail="UNAUTHORIZED")
 
     if not user.is_active:
-        raise HTTPException(status_code=423, detail="USER_DEACTIVATED")
+        raise HTTPException(status_code=423, detail="USER_INACTIVE")
 
     access_token = auth.create_access_token(uid=str(user.id), data={"role": user.role})
     return {"accessToken": access_token, "expiresIn": 3600, "user": user}

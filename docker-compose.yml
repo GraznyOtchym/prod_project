@@ -5,12 +5,13 @@ services:
     build: .
     container_name: prod_app
     ports:
-      - "8080:8080"
+      - "${SERVER_PORT:-8080}:${SERVER_PORT:-8080}"
     env_file:
       - .env
     environment:
-      - DB_HOST=db
-      - REDIS_HOST=redis
+      - DB_HOST=${DB_HOST:-db}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - SERVER_PORT=${SERVER_PORT:-8080}
     depends_on:
       db:
         condition: service_healthy
@@ -21,15 +22,15 @@ services:
     image: postgres:16.6-alpine
     container_name: prod_db
     ports:
-      - "5432:5432"
+      - "${DB_PORT:-5432}:5432"
     volumes:
-    - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     environment:
-      - POSTGRES_USER=${DB_USER}
-      - POSTGRES_PASSWORD=${DB_PASSWORD}
-      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_USER=${DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-postgres}
+      - POSTGRES_DB=${DB_NAME:-antifraud}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      test: ["CMD-SHELL", "pg_isready -U $${DB_USER:-postgres} -d $${DB_NAME:-anti_fraud}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -38,7 +39,12 @@ services:
     image: redis:7.4-alpine
     container_name: prod_redis
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-  volumes:
-    postgres_data:
+volumes:
+  postgres_data:

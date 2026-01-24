@@ -11,3 +11,6 @@ authx
 pwdlib
 greenlet
 lark
+pytest
+pytest-asyncio
+httpx
