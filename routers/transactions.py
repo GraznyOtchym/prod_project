@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,7 +29,9 @@ async def process_single_transaction(
         data.user_id if user.role == Role.ADMIN and data.user_id else user.id
     )
 
-    target_user = await session.get(User, target_user_id)
+    result = await session.execute(select(User).where(User.id == target_user_id))
+    target_user = result.scalar_one_or_none()
+
     if not target_user:
         raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
 
@@ -60,7 +63,7 @@ async def process_single_transaction(
 
     for rule in active_rules:
         try:
-            matched = await evaluate_rule(rule.dsl_expression, transaction, target_user)
+            matched = evaluate_rule(rule.dsl_expression, transaction, target_user)
             desc = "Rule matched" if matched else "Rule did not match"
         except Exception as e:
             matched = False
@@ -114,6 +117,48 @@ async def create_transaction(
             "createdAt": tx.extra_metadata["createdAt"],
         },
         "ruleResults": results,
+    }
+
+
+@router.get("/{id}")
+async def get_transaction_by_id(
+    id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    query = select(Transaction).where(Transaction.id == id)
+
+    result = await session.execute(query)
+    tx = result.scalar_one_or_none()
+
+    if not tx:
+        raise HTTPException(
+            status_code=404,
+            detail="NOT_FOUND",
+        )
+
+    if user.role != Role.ADMIN and tx.user_id != user.id:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    return {
+        "transaction": {
+            "id": tx.id,
+            "userId": tx.user_id,
+            "amount": tx.amount,
+            "currency": tx.currency,
+            "status": tx.extra_metadata.get("status"),
+            "merchantId": tx.merchant_id,
+            "merchantCategoryCode": tx.merchant_category_code,
+            "timestamp": tx.timestamp,
+            "ipAddress": tx.ip_address,
+            "deviceId": tx.device_id,
+            "channel": tx.channel,
+            "location": tx.location,
+            "isFraud": tx.extra_metadata.get("isFraud", False),
+            "metadata": tx.extra_metadata.get("user_metadata"),
+            "createdAt": tx.extra_metadata.get("createdAt"),
+        },
+        "ruleResults": tx.extra_metadata.get("ruleResults"),
     }
 
 
@@ -186,26 +231,82 @@ async def get_transactions(
     ]
 
 
-@router.post("/batch", status_code=201)
+@router.post("/batch")
 async def create_batch(
     data: BatchTransactions,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    items = []
-    for item_data in data.items:
-        tx, results = await process_single_transaction(item_data, user, session)
-        items.append(
-            {
-                "transaction": {
-                    "id": tx.id,
-                    "userId": tx.user_id,
-                    "status": tx.extra_metadata["status"],
-                    "isFraud": tx.extra_metadata["isFraud"],
-                },
-                "ruleResults": results,
+    response_items = []
+    error = False
+    success = False
+
+    for index, item_data in enumerate(data.items):
+        try:
+            tx, results = await process_single_transaction(item_data, user, session)
+
+            transaction_data = {
+                "id": str(tx.id),
+                "userId": str(tx.user_id),
+                "amount": float(tx.amount),
+                "currency": tx.currency,
+                "timestamp": tx.timestamp.isoformat()
+                if hasattr(tx.timestamp, "isoformat")
+                else str(tx.timestamp),
+                "merchantId": tx.merchant_id,
+                "merchantCategoryCode": tx.merchant_category_code,
+                "ipAddress": tx.ip_address,
+                "deviceId": tx.device_id,
+                "channel": tx.channel,
+                "location": tx.location,
+                # Данные из метадаты вытаскиваем безопасно
+                "status": tx.extra_metadata.get("status")
+                if tx.extra_metadata
+                else "UNKNOWN",
+                "isFraud": tx.extra_metadata.get("isFraud", False)
+                if tx.extra_metadata
+                else False,
+                "metadata": tx.extra_metadata.get("user_metadata")
+                if tx.extra_metadata
+                else {},
+                "createdAt": tx.extra_metadata.get("createdAt")
+                if tx.extra_metadata
+                else datetime.now(timezone.utc).isoformat(),
             }
-        )
+
+            response_items.append(
+                {
+                    "index": index,
+                    "decision": {
+                        "transaction": transaction_data,
+                        "ruleResults": results,
+                    },
+                }
+            )
+            success = True
+
+        except Exception as e:
+            error = True
+            response_items.append(
+                {
+                    "index": index,
+                    "error": {
+                        "code": "VALIDATION_FAILED",
+                        "message": str(e),
+                        "traceId": str(uuid.uuid4()),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "path": "/api/v1/transactions/batch",
+                    },
+                }
+            )
 
     await session.commit()
-    return {"items": items}
+
+    if error and success:
+        status_code = 207
+    elif success:
+        status_code = 201
+    else:
+        status_code = 422
+
+    return JSONResponse(status_code=status_code, content={"items": response_items})

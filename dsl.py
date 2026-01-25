@@ -1,125 +1,49 @@
 from decimal import Decimal
 from typing import Any
 
-from lark import Lark, Transformer, UnexpectedInput, UnexpectedToken
-from lark.exceptions import VisitError
+from lark import Lark, Transformer
+from lark.exceptions import UnexpectedInput, VisitError
 
 from schemas import DSLError, DSLValidationResponse
 
-dsl_grammar = r"""
-    ?start: expr
+DSL_GRAMMAR = r"""
+    ?start: expression
 
-    ?expr: or_expr
+    ?expression: term
+               | expression "OR"i term  -> binary_or
 
-    ?or_expr: and_expr
-            | or_expr OR and_expr
+    ?term: factor
+         | term "AND"i factor       -> binary_and
 
-    ?and_expr: not_expr
-             | and_expr AND not_expr
+    ?factor: "NOT"i factor          -> unary_not
+           | comparison
+           | "(" expression ")"
 
-    ?not_expr: comparison
-             | NOT not_expr
-             | "(" expr ")"
+    comparison: field operator value
 
-    comparison: field OP value
-
-    field: CNAME ("." CNAME)?
-
-    ?value: NUMBER      -> num_val
-          | SQ_STRING   -> str_val
-
-    OP: ">=" | "<=" | ">" | "<" | "=" | "!="
+    !field: CNAME ("." CNAME)?
     
+    operator: GREATER_EQUALS | LESS_EQUALS | GREATER | LESS | EQUALS | NOT_EQUALS
+
+    value: NUMBER      -> number_val
+         | SQ_STRING   -> string_val
+
+    GREATER_EQUALS: ">="
+    LESS_EQUALS: "<="
+    GREATER: ">"
+    LESS: "<"
+    EQUALS: "="
+    NOT_EQUALS: "!="
+
     SQ_STRING: /'[^']*'/
     
-    OR: "OR"i
-    AND: "AND"i
-    NOT: "NOT"i
-
     %import common.CNAME
     %import common.NUMBER
     %import common.WS
     %ignore WS
 """
 
-
-class DSLEvaluator(Transformer):
-    def field(self, items):
-        return "".join(str(i) for i in items)
-
-    def num_val(self, items):
-        return Decimal(items[0])
-
-    def str_val(self, items):
-        return items[0][1:-1]
-
-    def comparison(self, items):
-        field_name, op, val = items[0], items[1].value, items[2]
-
-        def get_value(tx, user):
-            if field_name == "amount":
-                return getattr(tx, "amount", 0)
-            if field_name == "currency":
-                return getattr(tx, "currency", "")
-            if field_name == "merchantId":
-                return getattr(tx, "merchant_id", "")
-            if field_name == "ipAddress":
-                return getattr(tx, "ip_address", "")
-            if field_name == "deviceId":
-                return getattr(tx, "device_id", "")
-            if field_name == "user.age":
-                return getattr(user, "age", 0)
-            if field_name == "user.region":
-                return getattr(user, "region", "")
-            return None
-
-        def compare(tx, user):
-            actual = get_value(tx, user)
-            if actual is None:
-                return False
-
-            if isinstance(val, Decimal) and not isinstance(actual, Decimal):
-                try:
-                    actual = Decimal(str(actual))
-                except Exception:
-                    return False
-
-            if op == ">":
-                return actual > val
-            if op == ">=":
-                return actual >= val
-            if op == "<":
-                return actual < val
-            if op == "<=":
-                return actual <= val
-            if op == "=":
-                return actual == val
-            if op == "!=":
-                return actual != val
-            return False
-
-        return compare
-
-    def unary_not(self, items):
-        inner_func = items[0]
-        return lambda tx, user: not inner_func(tx, user)
-
-    def binary_and(self, items):
-        left, right = items[0], items[1]
-        return lambda tx, user: left(tx, user) and right(tx, user)
-
-    def binary_or(self, items):
-        left, right = items[0], items[1]
-        return lambda tx, user: left(tx, user) or right(tx, user)
-
-    def start(self, items):
-        return items[0]
-
-
-_EXECUTOR_PARSER = Lark(dsl_grammar, parser="lalr", transformer=DSLEvaluator())
-
-
-FIELD_TYPES = {
+FIELD_METADATA = {
     "amount": "number",
     "currency": "string",
     "merchantId": "string",
@@ -131,142 +55,201 @@ FIELD_TYPES = {
 
 
 class DSLSemanticError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code: str, message: str):
         self.code = code
         self.message = message
 
 
 class DSLValidator(Transformer):
-    # Каждое правило возвращает кортеж: (нормализованная_строка, приоритет)
-    # Приоритеты: OR=0, AND=1, NOT=2, Comparison=3
-
     def field(self, items):
-        name = "".join(str(i) for i in items)
-        if name not in FIELD_TYPES:
-            raise DSLSemanticError("DSL_INVALID_FIELD", f"Unknown field: {name}")
-        return name
+        field_name = "".join(item.value for item in items)
+        if field_name not in FIELD_METADATA:
+            raise DSLSemanticError("DSL_INVALID_FIELD", f"Unknown field: {field_name}")
+        return field_name
 
-    def num_val(self, items):
-        return str(items[0]), "number"
+    def operator(self, items):
+        return items[0].value
 
-    def str_val(self, items):
-        return items[0], "string"  # Возвращаем с кавычками
+    def number_val(self, items):
+        return items[0].value, "number"
+
+    def string_val(self, items):
+        return items[0].value, "string"
 
     def comparison(self, items):
-        f_name = items[0]
-        op = items[1].value
+        field_name = items[0]
+        op = items[1]
         val_str, val_type = items[2]
 
-        f_type = FIELD_TYPES[f_name]
+        field_type = FIELD_METADATA[field_name]
 
-        # Проверка DSL_INVALID_OPERATOR по ТЗ
-        if f_type == "string" and op not in ("=", "!="):
+        if field_type != val_type:
             raise DSLSemanticError(
-                "DSL_INVALID_OPERATOR", f"Strings don't support {op}"
+                "DSL_INVALID_OPERATOR",
+                f"Type mismatch: {field_name} is {field_type}, value is {val_type}",
             )
 
-        if f_type != val_type:
+        if field_type == "string" and op not in ("=", "!="):
             raise DSLSemanticError(
-                "DSL_INVALID_OPERATOR", f"Type mismatch: {f_type} vs {val_type}"
+                "DSL_INVALID_OPERATOR", f"Operator {op} not allowed for string fields"
             )
 
-        # Нормализация: пробелы вокруг оператора по ТЗ
-        return f"{f_name} {op} {val_str}", 3
-
-    def or_expr(self, items):
-        # Если это цепочка OR
-        parts = []
-        for item in items:
-            # Для OR скобки внутри не нужны, если там AND или Comparison
-            parts.append(item[0])
-        return " OR ".join(parts), 0
-
-    def and_expr(self, items):
-        parts = []
-        for item in items:
-            text, priority = item
-            # Если внутри AND находится OR (priority 0), нужны скобки
-            parts.append(f"({text})" if priority < 1 else text)
-        return " AND ".join(parts), 1
+        return f"{field_name} {op} {val_str}", 3
 
     def unary_not(self, items):
-        text, priority = items[0]
-        # Если внутри NOT находится AND или OR, нужны скобки
-        res = f"NOT ({text})" if priority < 2 else f"NOT {text}"
-        return res, 2
+        expr, prio = items[0]
+        if prio < 2:
+            return f"NOT ({expr})", 2
+        return f"NOT {expr}", 2
 
-    def start(self, items):
-        return items[0][0]
+    def binary_and(self, items):
+        left, left_prio = items[0]
+        right, right_prio = items[1]
+
+        l_str = f"({left})" if left_prio < 1 else left
+        r_str = f"({right})" if right_prio < 1 else right
+        return f"{l_str} AND {r_str}", 1
+
+    def binary_or(self, items):
+        left, left_prio = items[0]
+        right, right_prio = items[1]
+
+        l_str = f"({left})" if left_prio < 0 else left
+        r_str = f"({right})" if right_prio < 0 else right
+        return f"{l_str} OR {r_str}", 0
 
 
-_PARSER = Lark(dsl_grammar, parser="lalr")
+class DSLEvaluator(Transformer):
+    def __init__(self, transaction: Any, user: Any):
+        self.transaction = transaction
+        self.user = user
+
+    def field(self, items):
+        return "".join(item.value for item in items)
+
+    def operator(self, items):
+        return items[0].value
+
+    def number_val(self, items):
+        return Decimal(items[0].value)
+
+    def string_val(self, items):
+        return items[0].value[1:-1]
+
+    def comparison(self, items):
+        field_name, op, val = items
+        actual_value = None
+
+        if "." in field_name:
+            parts = field_name.split(".")
+            prefix = parts[0]
+            attr = parts[1]
+            if prefix == "user" and self.user:
+                actual_value = getattr(self.user, attr, None)
+        else:
+            mapping = {
+                "deviceId": "device_id",
+                "merchantId": "merchant_id",
+                "ipAddress": "ip_address",
+                "merchantCategoryCode": "merchant_category_code",
+            }
+            attr_name = mapping.get(field_name, field_name)
+            actual_value = getattr(self.transaction, attr_name, None)
+
+        print(f"[DSL_STEP 2] DB Value: {actual_value} (Type: {type(actual_value)})")
+
+        if actual_value is None:
+            return False
+
+        if isinstance(val, (Decimal, int, float)):
+            try:
+                v1 = Decimal(str(actual_value))
+                v2 = Decimal(str(val))
+
+                if op == ">":
+                    res = v1 > v2
+                elif op == ">=":
+                    res = v1 >= v2
+                elif op == "<":
+                    res = v1 < v2
+                elif op == "<=":
+                    res = v1 <= v2
+                elif op == "=":
+                    res = v1 == v2
+                elif op == "!=":
+                    res = v1 != v2
+                else:
+                    res = False
+                return res
+            except Exception:
+                return False
+
+        res = False
+        if op == "=":
+            res = str(actual_value) == str(val)
+        elif op == "!=":
+            res = str(actual_value) != str(val)
+        return res
+
+    def unary_not(self, items):
+        return not items[0]
+
+    def binary_and(self, items):
+        return items[0] and items[1]
+
+    def binary_or(self, items):
+        return items[0] or items[1]
 
 
-def validate_dsl_logic(expression: str) -> DSLValidationResponse:
+_PARSER = Lark(DSL_GRAMMAR, parser="lalr")
+
+
+def validate_rule(expression: str) -> DSLValidationResponse:
     if not expression or not expression.strip():
         return DSLValidationResponse(
             isValid=False,
-            errors=[
-                DSLError(
-                    code="DSL_PARSE_ERROR",
-                    message="Empty expression",
-                    position=0,
-                    near="",
-                )
-            ],
+            errors=[DSLError(code="DSL_PARSE_ERROR", message="Empty expression")],
         )
 
     try:
-        # 1. Синтаксический анализ
         tree = _PARSER.parse(expression)
-
-        # 2. Семантика и нормализация через Transformer
-        normalized = DSLValidator().transform(tree)
-
+        normalized, _ = DSLValidator().transform(tree)
         return DSLValidationResponse(
             isValid=True, normalizedExpression=normalized, errors=[]
         )
 
-    except (UnexpectedToken, UnexpectedInput) as e:
-        # Ошибка синтаксиса (DSL_PARSE_ERROR)
-        col = getattr(e, "column", 0)
+    except UnexpectedInput as e:
         return DSLValidationResponse(
             isValid=False,
             errors=[
                 DSLError(
                     code="DSL_PARSE_ERROR",
                     message="Syntax error",
-                    position=col,
-                    near=expression[max(0, col - 5) : col + 5],
+                    position=e.column,
+                    near=e.get_context(expression, span=5),
                 )
             ],
         )
-
     except VisitError as e:
-        # Ошибки из Трансформера (Field и Operator)
         orig = e.orig_exc
         if isinstance(orig, DSLSemanticError):
             return DSLValidationResponse(
                 isValid=False, errors=[DSLError(code=orig.code, message=orig.message)]
             )
         return DSLValidationResponse(
-            isValid=False,
-            errors=[DSLError(code="DSL_INTERNAL_ERROR", message=str(orig))],
+            isValid=False, errors=[DSLError(code="DSL_PARSE_ERROR", message=str(orig))]
         )
-
     except Exception as e:
         return DSLValidationResponse(
-            isValid=False, errors=[DSLError(code="DSL_INTERNAL_ERROR", message=str(e))]
+            isValid=False, errors=[DSLError(code="DSL_PARSE_ERROR", message=str(e))]
         )
 
 
-async def evaluate_rule(dsl_expression: str, transaction: Any, user: Any) -> bool:
+def evaluate_rule(expression: str, transaction: Any, user: Any) -> bool:
     try:
-        if not dsl_expression or not dsl_expression.strip():
+        if not expression or not expression.strip():
             return False
-
-        rule_func = _EXECUTOR_PARSER.parse(dsl_expression)
-
-        return bool(rule_func(transaction, user))
+        tree = _PARSER.parse(expression)
+        return bool(DSLEvaluator(transaction, user).transform(tree))
     except Exception:
         return False

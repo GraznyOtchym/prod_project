@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db import get_session
 from dependencies import is_admin
-from dsl import validate_dsl_logic
+from dsl import validate_rule
 from models import FraudRule
 from schemas import (
     DSLError,
@@ -127,4 +127,4 @@ async def validate_fraud_rule(payload: DSLValidateRequest):
             ],
         )
 
-    return validate_dsl_logic(dsl)
+    return validate_rule(dsl)

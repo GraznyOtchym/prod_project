@@ -11,7 +11,6 @@ from pydantic import (
     EmailStr,
     Field,
     field_validator,
-    model_validator,
 )
 
 
@@ -164,16 +163,10 @@ class DSLValidationResponse(BaseModel):
 
 
 class LocationBase(BaseModel):
-    country: str = Field(..., min_length=2, max_length=2, pattern="^[A-Z]{2}$")
-    city: str = Field(..., max_length=128)
+    country: str | None = Field(None, min_length=2, max_length=2, pattern="^[A-Z]{2}$")
+    city: str | None = Field(None, max_length=128)
     latitude: float | None = Field(None, ge=-90, le=90)
     longitude: float | None = Field(None, ge=-180, le=180)
-
-    @model_validator(mode="after")
-    def check_lat_lng_pair(self) -> "LocationBase":
-        if (self.latitude is None) != (self.longitude is None):
-            raise ValueError("latitude and longitude must be provided together")
-        return self
 
 
 class TransactionCreate(BaseModel):
